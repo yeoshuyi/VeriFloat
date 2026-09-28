@@ -1,0 +1,31 @@
+[project]
+name = "customtypes"
+version = "0.1.0"
+description = "Bit-accurate fixed-width integers (UINT, INT) and custom minifloats (FP, e.g. NVFP4/E2M1) in pure Python"
+readme = "README.md"
+license = "MIT"
+authors = [{ name = "sy", email = "yeoshuyi123@gmail.com" }]
+requires-python = ">=3.13"
+dependencies = []
+keywords = ["fixed-width", "integer", "minifloat", "fp4", "nvfp4", "e2m1", "quantization", "hardware"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.13",
+    "Operating System :: OS Independent",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering",
+    "Typing :: Typed",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
