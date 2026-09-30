@@ -1,22 +1,29 @@
 [project]
-name = "customtypes"
+name = "VeriFloat"
 version = "0.1.0"
-description = "Bit-accurate fixed-width integers (UINT, INT) and custom minifloats (FP, e.g. NVFP4/E2M1) in pure Python"
+description = "Bit-accurate floating-point, integer and block-scaled types in pure Python, as golden models for cocotb RTL testbenches"
 readme = "README.md"
 license = "MIT"
-authors = [{ name = "sy", email = "yeoshuyi123@gmail.com" }]
-requires-python = ">=3.13"
+authors = [{ name = "Shu Yi", email = "yeoshuyi123@gmail.com" }]
+requires-python = ">=3.12"
 dependencies = []
-keywords = ["fixed-width", "integer", "minifloat", "fp4", "nvfp4", "e2m1", "quantization", "hardware"]
+keywords = ["verification", "rtl", "cocotb", "golden-model", "bit-exact", "floating-point", "minifloat", "fp4", "fp8", "nvfp4", "fpga", "asic"]
 classifiers = [
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Development Status :: 3 - Alpha",
     "Operating System :: OS Independent",
     "Intended Audience :: Developers",
     "Intended Audience :: Science/Research",
     "Topic :: Scientific/Engineering",
+    "Topic :: Scientific/Engineering :: Electronic Design Automation (EDA)",
+    "Topic :: Software Development :: Testing",
     "Typing :: Typed",
 ]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/verifloat"]
 
 [build-system]
 requires = ["hatchling"]
@@ -24,8 +31,19 @@ build-backend = "hatchling.build"
 
 [dependency-groups]
 dev = [
-    "pytest>=9.1.1",
+    "pytest>=8",
+    # External golden references used by tests/test_external.py
+    "numpy>=1.26",
+    "ml-dtypes>=0.5",
+    "gfloat>=0.5",
+    "apytypes>=0.5",
+]
+# Worked cocotb example (examples/fp32_adder); needs Verilator on PATH
+examples = [
+    "cocotb>=2.0",
 ]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# Tests must capture every FP warning they expect; any other one fails.
+filterwarnings = ["error::verifloat.VeriFloatWarning"]

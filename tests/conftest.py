@@ -1,6 +1,6 @@
 """Seeded RNG for constrained random tests.
 
-Set CUSTOMTYPES_SEED to reproduce a run and CUSTOMTYPES_ITERS to change
+Set VERIFLOAT_SEED to reproduce a run and VERIFLOAT_ITERS to change
 how many random cases each test draws.
 """
 
@@ -11,12 +11,12 @@ import random
 
 import pytest
 
-SEED = int(os.environ.get("CUSTOMTYPES_SEED", random.randrange(1 << 32)))
-ITERS = int(os.environ.get("CUSTOMTYPES_ITERS", 2000))
+SEED = int(os.environ.get("VERIFLOAT_SEED", random.randrange(1 << 32)))
+ITERS = int(os.environ.get("VERIFLOAT_ITERS", 2000))
 
 
 def pytest_report_header(config):
-    return f"customtypes: CUSTOMTYPES_SEED={SEED} CUSTOMTYPES_ITERS={ITERS}"
+    return f"verifloat: VERIFLOAT_SEED={SEED} VERIFLOAT_ITERS={ITERS}"
 
 
 @pytest.hookimpl(wrapper=True)
@@ -24,7 +24,7 @@ def pytest_runtest_makereport(item, call):
     report = yield
     if report.failed:
         report.sections.append(
-            ("reproduce", f"CUSTOMTYPES_SEED={SEED} pytest '{item.nodeid}'"))
+            ("reproduce", f"VERIFLOAT_SEED={SEED} pytest '{item.nodeid}'"))
     return report
 
 

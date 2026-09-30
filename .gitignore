@@ -26,3 +26,7 @@ CLAUDE.local.md
 .vscode/
 *.swp
 .DS_Store
+
+# Simulator build output
+sim_build/
+results.xml
