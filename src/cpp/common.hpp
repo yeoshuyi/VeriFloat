@@ -23,6 +23,13 @@
 #include <utility>
 #include <vector>
 
+// MinGW's math.h defines the old System V matherr codes as macros unless the
+// compiler is in strict ISO mode (-std=c++20 rather than gnu++20). Two of them
+// collide with the names below; math.h is include-guarded, so removing them
+// here, after <cmath>, keeps them out for good.
+#undef OVERFLOW
+#undef UNDERFLOW
+
 namespace vf {
 
 // The core (this header, kernel.hpp, ops.hpp, the fast kernels) is plain
