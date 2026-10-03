@@ -7,9 +7,16 @@ defined parts (which NaN is returned, what an invalid float-to-integer
 conversion gives), matching VeriFloat's NaNMode.CANONICAL (RISC-V),
 NaNMode.X86 (8086-SSE) and NaNMode.ARM (ARM-VFPv2).
 
-Every result bit pattern and every flag must match. The first run downloads
-and builds TestFloat (see testfloat_build.py); without a C toolchain or
-network access these tests are skipped.
+Every result bit pattern and every flag must match, for binary16, binary32,
+binary64 and binary128. The first run downloads and builds TestFloat (see
+testfloat_build.py); without a C toolchain or network access these tests are
+skipped.
+
+A default run takes an evenly spaced sample of TestFloat's level-1 sequence
+(VERIFLOAT_TESTFLOAT_N cases per function, 300 by default; one-operand
+functions are always complete). VERIFLOAT_TESTFLOAT_N=0 takes every case of
+the level (46,464 per two-operand function, 6,133,248 per fused multiply-add),
+and VERIFLOAT_TESTFLOAT_LEVEL=2 selects TestFloat's larger level.
 """
 
 from __future__ import annotations
@@ -20,14 +27,16 @@ import subprocess
 
 import pytest
 
-from verifloat import FP16, FP32, FP64, INT, UINT, FPFlags, NaNMode, Rounding
+from conftest import COMPARED
+from verifloat import FP16, FP32, FP64, INT, UINT, FPFlags, FPFormat, NaNMode, Rounding
 
 N = int(os.environ.get("VERIFLOAT_TESTFLOAT_N", 300))
+LEVEL = os.environ.get("VERIFLOAT_TESTFLOAT_LEVEL", "1")
 
 SPECS = {"RISCV": NaNMode.CANONICAL, "8086-SSE": NaNMode.X86, "ARM-VFPv2": NaNMode.ARM}
 MODES = {Rounding.RNE: "-rnear_even", Rounding.RTZ: "-rminMag", Rounding.RDN: "-rmin",
          Rounding.RUP: "-rmax", Rounding.RNA: "-rnear_maxMag"}
-FORMATS = {"f16": FP16, "f32": FP32, "f64": FP64}
+FORMATS = {"f16": FP16, "f32": FP32, "f64": FP64, "f128": FPFormat(15, 112)}
 INTS = {"i32": (32, True), "ui32": (32, False), "i64": (64, True), "ui64": (64, False)}
 
 
@@ -41,8 +50,8 @@ def generators():
 
 
 def cases(gen, function, *opts, n=N):
-    """n test cases spread across TestFloat's level-1 sequence."""
-    proc = subprocess.Popen([str(gen), *opts, function], stdout=subprocess.PIPE, text=True)
+    """n test cases spread across TestFloat's sequence (all of it if N is 0)."""
+    proc = subprocess.Popen([str(gen), "-level", LEVEL, *opts, function], stdout=subprocess.PIPE, text=True)
     try:
         # Level-1 sequences are ordered. One-operand functions have only a
         # few hundred cases, so take them all; for two operands (~46k cases)
@@ -50,8 +59,9 @@ def cases(gen, function, *opts, n=N):
         unary = function.endswith(("sqrt", "roundToInt")) or "_to_" in function
         stride = 1 if unary else 997 if function.endswith("mulAdd") else 37
         limit = None if unary else n
-        lines = itertools.islice(proc.stdout, 0, None, stride)
-        return [line.split() for line in itertools.islice(lines, limit)]
+        lines = proc.stdout if N == 0 else itertools.islice(itertools.islice(proc.stdout, 0, None, stride), limit)
+        for line in lines:                  # streamed: a complete sequence has millions of lines
+            yield line.split()
     finally:
         proc.kill()
         proc.wait()
@@ -63,6 +73,7 @@ def fmt_for(name, spec, rounding, tininess="after"):
 
 
 def check(got_raw, got_flags, want_raw, want_flags, ctx):
+    COMPARED["Berkeley TestFloat (result and flags)"] += 1
     assert (got_raw, int(got_flags)) == (want_raw, want_flags), \
         f"{ctx}: got {got_raw:#x} flags {int(got_flags):#x}, " \
         f"SoftFloat {want_raw:#x} flags {want_flags:#x}"
@@ -79,8 +90,8 @@ def run_arith(gen, spec, fname, op, rounding, tininess):
         check(x.raw, x.flags, int(r, 16), int(fl, 16), f"{spec} {fname}_{op} {a} {b}")
 
 
-# Arithmetic: every rounding mode and both tininess conventions (RISC-V),
-# RNE for the x86 and ARM NaN conventions.
+# Arithmetic: every rounding mode and both tininess conventions, under each
+# NaN convention (RISC-V, x86 SSE, ARM VFP).
 @pytest.mark.parametrize("fname", FORMATS)
 @pytest.mark.parametrize("op", ARITH)
 @pytest.mark.parametrize("rounding", MODES)
@@ -92,16 +103,16 @@ def test_arith_riscv(generators, fname, op, rounding, tininess):
 @pytest.mark.parametrize("spec", ["8086-SSE", "ARM-VFPv2"])
 @pytest.mark.parametrize("fname", FORMATS)
 @pytest.mark.parametrize("op", ARITH)
-def test_arith_nan_conventions(generators, spec, fname, op):
-    run_arith(generators[spec], spec, fname, op, Rounding.RNE, "after")
+@pytest.mark.parametrize("rounding", MODES)
+@pytest.mark.parametrize("tininess", ["after", "before"])
+def test_arith_nan_conventions(generators, spec, fname, op, rounding, tininess):
+    run_arith(generators[spec], spec, fname, op, rounding, tininess)
 
 
 @pytest.mark.parametrize("spec", SPECS)
 @pytest.mark.parametrize("fname", FORMATS)
 @pytest.mark.parametrize("rounding", MODES)
 def test_fma(generators, spec, fname, rounding):
-    if spec != "RISCV" and rounding is not Rounding.RNE:
-        pytest.skip("NaN conventions are checked with RNE only")
     fmt = fmt_for(fname, spec, rounding)
     for a, b, c, r, fl in cases(generators[spec], f"{fname}_mulAdd", MODES[rounding]):
         fa, fb, fc = (fmt.from_raw(int(v, 16)) for v in (a, b, c))
@@ -119,8 +130,6 @@ def test_fma(generators, spec, fname, rounding):
 @pytest.mark.parametrize("fname", FORMATS)
 @pytest.mark.parametrize("rounding", MODES)
 def test_sqrt(generators, spec, fname, rounding):
-    if spec != "RISCV" and rounding is not Rounding.RNE:
-        pytest.skip("NaN conventions are checked with RNE only")
     fmt = fmt_for(fname, spec, rounding)
     for a, r, fl in cases(generators[spec], f"{fname}_sqrt", MODES[rounding]):
         x = fmt.from_raw(int(a, 16)).sqrt()
@@ -170,8 +179,6 @@ def test_int_to_float(generators, fname, iname, rounding):
 @pytest.mark.parametrize("src, dst", [(s, d) for s in FORMATS for d in FORMATS if s != d])
 @pytest.mark.parametrize("rounding", MODES)
 def test_float_to_float(generators, spec, src, dst, rounding):
-    if spec != "RISCV" and rounding is not Rounding.RNE:
-        pytest.skip("NaN conventions are checked with RNE only")
     fs, fd = fmt_for(src, spec, rounding), fmt_for(dst, spec, rounding)
     for a, r, fl in cases(generators[spec], f"{src}_to_{dst}", MODES[rounding]):
         x = fs.from_raw(int(a, 16)).convert(fd)
@@ -183,12 +190,13 @@ COMPARE = {"eq": ("eq", False), "le": ("le", True), "lt": ("lt", True),
            "lt_quiet": ("lt", False)}
 
 
+@pytest.mark.parametrize("spec", SPECS)
 @pytest.mark.parametrize("fname", FORMATS)
 @pytest.mark.parametrize("op", COMPARE)
-def test_compare(generators, fname, op):
-    fmt = fmt_for(fname, "RISCV", Rounding.RNE)
+def test_compare(generators, spec, fname, op):
+    fmt = fmt_for(fname, spec, Rounding.RNE)
     method, signaling = COMPARE[op]
-    for a, b, r, fl in cases(generators["RISCV"], f"{fname}_{op}"):
+    for a, b, r, fl in cases(generators[spec], f"{fname}_{op}"):
         res, flags = getattr(fmt.from_raw(int(a, 16)), method)(fmt.from_raw(int(b, 16)),
                                                                signaling=signaling)
         check(int(res), flags, int(r, 16), int(fl, 16), f"{fname}_{op} {a} {b}")

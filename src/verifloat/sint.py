@@ -1,23 +1,7 @@
+"""Fixed-width two's-complement integers (native type from the C++ core)."""
+
 from __future__ import annotations
 
-from .uint import UINT
+from ._core import INT, UINT  # noqa: F401  (UINT as in 0.1)
 
-
-class INT(UINT):
-    __slots__ = ()
-    signed = True
-
-    # Getters
-    @property
-    def val(self) -> int:
-        if self._val >> (self._bits - 1):
-            return self._val - (1 << self._bits)
-        return self._val
-
-    @property
-    def min(self) -> int:
-        return -(1 << (self._bits - 1))
-
-    @property
-    def max(self) -> int:
-        return (1 << (self._bits - 1)) - 1
+__all__ = ["INT"]

@@ -22,6 +22,7 @@ import math
 from dataclasses import dataclass
 from fractions import Fraction
 
+from . import _core
 from .fp import FP, FPFlags, FPFormat, _floor_log2
 
 _F = FPFlags
@@ -53,9 +54,17 @@ class Accumulator:
             parts.append(f"{self.align_bits} bits below the group max")
         return ", ".join(parts)
 
+    def _spec(self) -> tuple:
+        return (self.fmt, self.order, self.product, self.group, self.align_bits)
+
     def sum_products(self, a, b, init=None) -> FP:
         """sum(a[i] * b[i]) (+ init) as this accumulator computes it.
         Operands may be FP values or exact numbers."""
+        a, b = list(a), list(b)
+        r = _core.acc_sum_products(a, b, init, self._spec())
+        if r is not None:
+            return r
+        # Non-dyadic or non-finite numbers: the reference implementation.
         terms = [_mul(x, y, self.product) for x, y in zip(a, b, strict=True)]
         return self._sum(terms, init)
 

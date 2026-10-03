@@ -1,7 +1,7 @@
 [project]
 name = "VeriFloat"
 version = "0.1.0"
-description = "Bit-accurate floating-point, integer and block-scaled types in pure Python, as golden models for cocotb RTL testbenches"
+description = "Bit-accurate floating-point, integer and block-scaled types with a C++ core, as golden models for cocotb RTL testbenches"
 readme = "README.md"
 license = "MIT"
 authors = [{ name = "Shu Yi", email = "yeoshuyi123@gmail.com" }]
@@ -22,12 +22,15 @@ classifiers = [
     "Typing :: Typed",
 ]
 
-[tool.hatch.build.targets.wheel]
-packages = ["src/verifloat"]
-
 [build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
+requires = ["scikit-build-core>=0.10", "nanobind>=2.4"]
+build-backend = "scikit_build_core.build"
+
+[tool.scikit-build]
+minimum-version = "build-system.requires"
+build-dir = "build/{wheel_tag}"
+wheel.packages = ["src/verifloat"]
+cmake.build-type = "Release"
 
 [dependency-groups]
 dev = [
@@ -37,11 +40,17 @@ dev = [
     "ml-dtypes>=0.5",
     "gfloat>=0.5",
     "apytypes>=0.5",
+    # Frozen pure-Python 0.1 (archive/python), the oracle for tests/test_parity.py
+    "verifloat-py",
+    "gmpy2>=2.2",
 ]
 # Worked cocotb example (examples/fp32_adder); needs Verilator on PATH
 examples = [
     "cocotb>=2.0",
 ]
+
+[tool.uv.sources]
+verifloat-py = { path = "archive/python", editable = true }
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

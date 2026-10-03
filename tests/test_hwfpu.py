@@ -19,6 +19,7 @@ from pathlib import Path
 import pytest
 
 from verifloat import FP32, FP64, FPFlags, NaNMode, Rounding
+from conftest import COMPARED
 from test_external import rand_bits
 
 pytestmark = pytest.mark.skipif(
@@ -90,6 +91,55 @@ def test_x86_sse(hw, rng, iters, fmt, width, op, rounding, ftz):
         else:
             assert got.raw == want, f"{ctx}: model {got.raw:#x} != hw {want:#x}"
         assert got.flags == want_flags, f"{ctx}: model {got.flags!r} != hw {want_flags!r}"
+        COMPARED["x86-64 processor, SSE and FMA (result and flags)"] += 1
+
+
+def designed(fmt, op):
+    """The designed cases of tests/directed.py for one operation, as triples."""
+    import directed as D
+    edges = D.edge_codes(fmt)
+    if op in ("add", "sub"):
+        sets = [(a, b, 0) for a, b in D.add_cases(fmt)]
+    elif op == "mul":
+        sets = [(a, b, 0) for a, b in D.mul_cases(fmt)]
+    elif op == "div":
+        sets = [(a, b, 0) for a, b in D.div_cases(fmt)]
+    elif op == "sqrt":
+        return [(a, 0, 0) for a in [*D.sqrt_cases(fmt), *edges]]
+    else:
+        few = D.few_edges(fmt)
+        return D.fma_cases(fmt) + [(a, b, c) for a in few for b in few for c in few]
+    return sets + [(a, b, 0) for a in edges for b in edges]
+
+
+@pytest.mark.parametrize("fmt, width", [(FP32, 32), (FP64, 64)], ids=["fp32", "fp64"])
+@pytest.mark.parametrize("op", OPS)
+@pytest.mark.parametrize("rounding", RC)
+@pytest.mark.parametrize("ftz", [False, True], ids=["ieee", "ftz_daz"])
+def test_x86_sse_designed_cases(hw, iters, fmt, width, op, rounding, ftz):
+    """The processor on the designed cases: results on and next to rounding
+    ties, the overflow threshold, the bottom of the normal range and the
+    subnormal range, and every pair of special values (tests/directed.py).
+    Each result and all five flags, in the four hardware rounding modes,
+    with and without FTZ+DAZ."""
+    if op == "fma" and not hw.has_fma():
+        pytest.skip("CPU has no FMA")
+    f = fmt.replace(rounding=rounding, ftz=ftz, nan_mode=NaNMode.X86)
+    cases = designed(fmt, op)
+    if iters < 2000:                        # a reduced run: an evenly spread part
+        cases = cases[::max(len(cases) * 2 // max(iters, 100), 1)]
+    bad = []
+    for a, b, c in cases:
+        want, want_flags = hw_run(hw, width, op, a, b, c, rounding, ftz)
+        got = model_run(f, op, a, b, c)
+        if op == "fma" and got.is_nan:      # the NaN an x86 FMA returns depends on the instruction form
+            same = fmt.from_raw(want).is_nan
+        else:
+            same = got.raw == want
+        if not same or got.flags != want_flags:
+            bad.append((hex(a), hex(b), hex(c), hex(got.raw), got.flags, hex(want), want_flags))
+    COMPARED["x86-64 processor, SSE and FMA (result and flags)"] += len(cases)
+    assert not bad, f"{op} {rounding} ftz={ftz}: {len(bad)} of {len(cases)} differ from the processor: {bad[:5]}"
 
 
 @pytest.mark.parametrize("rounding", RC)

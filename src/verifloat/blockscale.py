@@ -17,21 +17,14 @@ import math
 from dataclasses import KW_ONLY, dataclass
 from fractions import Fraction
 
+from . import _core
 from ._warnings import BlockFormatWarning, CastWarning
 from ._warnings import warn as _warn
 from .accum import Accumulator
-from .fp import E2M1, E4M3, FP, FP32, FPFlags, FPFormat, Rounding, _pow2, _round_sig
+from .array import FPArray
+from .fp import E2M1, E4M3, FP, FP32, FPFlags, FPFormat, Rounding, _ROUNDINGS, _pow2, _round_sig
 from .sint import INT
 from .uint import UINT
-
-
-def _floor_log2(x: Fraction) -> int:
-    """floor(log2(x)) for x > 0."""
-    n, d = x.numerator, x.denominator
-    e = n.bit_length() - d.bit_length()
-    if (n << max(0, -e)) < (d << max(0, e)):
-        e -= 1
-    return e
 
 
 def _to_fraction(v) -> Fraction:
@@ -224,6 +217,23 @@ class BlockFormat:
         cap = self.scale.max
         return min(cap, self.scale_max) if self.scale_max is not None else cap
 
+    def _native(self) -> tuple:
+        """Parameters for the native quantizer (computed once)."""
+        spec = self.__dict__.get("_native_spec")
+        if spec is None:
+            e, sc, zp = self.elem, self.scale, self.zero_point
+            elem_fp = e if isinstance(e, FPFormat) else None
+            ints = lambda f: (f.bits, f.signed, _ROUNDINGS.index(f.rounding), f.frac_bits)
+            kind = 0 if sc is None else (1 if isinstance(sc, FPFormat) else 2)
+            spec = (elem_fp, None if elem_fp else ints(e), Fraction(self.elem_max),
+                    self.block_size, kind, sc if kind == 1 else None,
+                    (sc.bits, sc.bias, sc.max_code) if kind == 2 else None,
+                    Fraction(self.scale_cap), None if zp is None else ints(zp),
+                    self.tensor_scale, self.compute, self.scale_min, self.zero_scale,
+                    _to_fraction)
+            object.__setattr__(self, "_native_spec", spec)
+        return spec
+
     def _c(self, x: Fraction) -> Fraction:
         """One step of the recipe's intermediate arithmetic."""
         if self.compute is None or x == 0:
@@ -272,6 +282,22 @@ def _shape(values) -> tuple[int, ...]:
     return ()
 
 
+def _as_lists(values):
+    """NumPy arrays and other array-likes as nested lists (their numbers
+    become Python floats and ints, exactly)."""
+    if (not isinstance(values, (list, tuple, BlockTensor, FPArray, FP))
+            and hasattr(values, "tolist") and hasattr(values, "shape")):
+        return values.tolist()
+    return values
+
+
+def _shape_flat(values) -> tuple[tuple[int, ...], list]:
+    """(_shape(values), _flatten(values)) in one native pass."""
+    values = _as_lists(values)
+    r = _core.shape_flatten(values, BlockTensor)
+    return r if r is not None else (_shape(values), _flatten(values))
+
+
 def _flatten(values) -> list:
     if isinstance(values, (list, tuple)):
         return [x for v in values for x in _flatten(v)]
@@ -297,12 +323,7 @@ def _strides(shape):
 
 def _permute(flat: list, shape: tuple, perm: tuple) -> list:
     """Flat C-order data of ``shape`` transposed by ``perm``."""
-    st = _strides(shape)
-    new_shape = tuple(shape[p] for p in perm)
-    out = []
-    for idx in _indices(new_shape):
-        out.append(flat[sum(i * st[p] for i, p in zip(idx, perm))])
-    return out
+    return _core.permute(flat, shape, perm)
 
 
 def _indices(shape):
@@ -314,13 +335,15 @@ def _indices(shape):
             yield (i,) + rest
 
 
-def _values_of(values) -> tuple[tuple[int, ...], list[Fraction]]:
+def _values_of(values) -> tuple[tuple[int, ...], list]:
+    """Shape and flat C-order values (converted with _to_fraction by the
+    native quantizer, which raises the same errors)."""
     if isinstance(values, BlockTensor):
         return values.shape, list(values._flat_values())
-    shape = _shape(values)
+    shape, flat = _shape_flat(values)
     if not shape:
         raise ValueError("expected a tensor (nested lists), not a scalar")
-    return shape, [_to_fraction(x) for x in _flatten(values)]
+    return shape, flat
 
 
 class BlockTensor:
@@ -362,88 +385,11 @@ class BlockTensor:
         t = object.__new__(cls)
         t.fmt, t.shape, t._cache = fmt, shape, None
         t.axis = cls._norm_axis(axis, len(shape))
-        rows = t._to_rows(flat)
         t._source = flat
-        t._flags = FPFlags(0)
-        t._tscale, s_t = t._quantize_tensor_scale(flat)
-        t._elems, t._scales = [], []
-        t._zeros = [] if fmt.zero_point is not None else None
-        for row in rows:
-            er, sr, zr = [], [], []
-            for start in range(0, len(row), fmt.block_size):
-                block = row[start:start + fmt.block_size]
-                scale_obj, s_b, zero_obj, z = t._quantize_block_scale(block, s_t)
-                sr.append(scale_obj)
-                zr.append(zero_obj)
-                step = fmt._c(s_b * s_t)
-                for x in block:
-                    er.append(t._quantize_elem(x, step, z))
-            t._elems.append(er)
-            t._scales.append(sr)
-            if t._zeros is not None:
-                t._zeros.append(zr)
+        t._tscale, t._elems, t._scales, t._zeros, flags = _core.block_quantize(
+            flat, shape, t.axis, fmt._native())
+        t._flags = FPFlags(flags)
         return t
-
-    def _quantize_tensor_scale(self, flat):
-        fmt = self.fmt
-        if fmt.tensor_scale is None:
-            return None, Fraction(1)
-        amax = max(abs(x) for x in flat)
-        target = (fmt._c(amax / fmt._c(fmt.elem_max * fmt.scale_cap))
-                  if amax else Fraction(1))
-        ts = FP._round(target, fmt.tensor_scale)[0]
-        if ts.exact <= 0:
-            raise ValueError(f"tensor scale {float(target)!r} underflowed "
-                             f"{fmt.tensor_scale}")
-        return ts, ts.exact
-
-    def _quantize_block_scale(self, block, s_t):
-        """Returns (scale_obj, scale_value, zero_obj, zero_value)."""
-        fmt, scale = self.fmt, self.fmt.scale
-        if scale is None:
-            return None, Fraction(1), None, 0
-        if isinstance(scale, Pow2Format):
-            amax = max(abs(x) for x in block) / s_t
-            if amax == 0:
-                code = 0   # smallest scale, as OCP reference code (gfloat) does
-            else:
-                shared = _floor_log2(amax) - _floor_log2(fmt.elem_max)
-                code = min(max(shared + scale.bias, 0), scale.max_code)
-            return UINT(code, scale.bits), scale.value(code), None, 0
-
-        if fmt.zero_point is None:
-            span = fmt._c(max(abs(x) for x in block) / fmt._c(fmt.elem_max * s_t))
-        else:
-            lo, hi = min(min(block), 0), max(max(block), 0)
-            span = fmt._c((hi - lo) / fmt._c((fmt.elem.max - fmt.elem.min)
-                                             * fmt.elem.unit * s_t))
-        if span == 0 and fmt.zero_scale is not None:
-            span = fmt.zero_scale
-        elif span and fmt.scale_min is not None:
-            span = max(span, fmt.scale_min)
-        # Clamp before rounding so a scale never overflows (to inf/NaN).
-        scale_obj = FP._round(min(span, fmt.scale_cap), scale)[0]
-        s_b = scale_obj.exact
-        if fmt.zero_point is None:
-            return scale_obj, s_b, None, 0
-        if s_b == 0:
-            zero_obj = fmt.zero_point(0)
-        else:
-            zero_obj, _ = fmt.zero_point.quantize(
-                fmt.elem.min - lo / (s_b * s_t * fmt.elem.unit))
-        return scale_obj, s_b, zero_obj, zero_obj.val
-
-    def _quantize_elem(self, x: Fraction, step: Fraction, z: int):
-        elem = self.fmt.elem
-        v = Fraction(0) if step == 0 else self.fmt._c(x / step)  # zero scale: zero block
-        if isinstance(elem, FPFormat):
-            # Quantizers saturate elements: no inf/NaN or wrapped codes.
-            obj, flags, _ = FP._round(v, elem.replace(saturate=True, wrap=False))
-            obj = FP._from_raw_fmt(obj.raw, elem)
-        else:
-            obj, flags = elem.quantize(v / elem.unit + z)
-        self._flags |= flags
-        return obj
 
     @classmethod
     def from_raw(cls, elem_codes, scale_codes=None, fmt: BlockFormat = NVFP4,
@@ -531,6 +477,14 @@ class BlockTensor:
 
     def _flat_values(self) -> list[Fraction]:
         if self._cache is None:
+            vals = _core.block_values(self._elems, self._scales, self._zeros, self._tscale,
+                                      self.fmt._native())
+            if vals is not None:
+                perm = self._perm
+                inverse = tuple(perm.index(i) for i in range(len(perm)))
+                self._cache = _permute(vals, tuple(self.shape[p] for p in perm), inverse)
+                return self._cache
+            # inf/NaN codes: the reference path raises the right error
             s_t = self._tscale.exact if self._tscale is not None else Fraction(1)
             bs = self.fmt.block_size
             rows = []
@@ -559,7 +513,8 @@ class BlockTensor:
         """Max |source - dequantized| if built by quantize(), else None."""
         if self._source is None:
             return None
-        return max(abs(s - q) for s, q in zip(self._source, self._flat_values()))
+        src = [_to_fraction(x) for x in self._source]
+        return max(abs(s - q) for s, q in zip(src, self._flat_values()))
 
     def __getitem__(self, idx):
         vals = self._flat_values()
@@ -691,14 +646,21 @@ def _operand(v) -> tuple[tuple[int, ...], list]:
     """(shape, flat values) keeping FP operands as FP (for inf/NaN)."""
     if isinstance(v, BlockTensor):
         return v.shape, list(v._flat_values())
-    shape = _shape(v)
-    return shape, [x if isinstance(x, FP) else _to_fraction(x) for x in _flatten(v)]
+    if isinstance(v, FPArray):
+        return v.shape, v._flat()
+    shape, flat = _shape_flat(v)
+    if _core.plain_numbers(flat):   # used as they are (same exact values)
+        return shape, flat
+    return shape, [x if isinstance(x, FP) else _to_fraction(x) for x in flat]
 
 
 def _reduce(a: list, b: list, acc):
     """sum(a[i]*b[i]): exact Fraction, or FP per acc (FPFormat: exact then one
     rounding; Accumulator: that accumulation model)."""
     if acc is None:
+        r = _core.exact_dot(a, b)
+        if r is not None:
+            return r
         if any(isinstance(x, FP) and not x.is_finite for x in a + b):
             raise ValueError("inf/NaN operands need an accumulator format (acc=...)")
         return sum((_to_fraction(x) * _to_fraction(y) for x, y in zip(a, b)), Fraction(0))
@@ -727,12 +689,24 @@ def matmul(a, b, acc: FPFormat | Accumulator | None = None,
     Each output is exact (Fraction), or rounded per ``acc`` (an FPFormat for
     one rounding, or an Accumulator). With ``out`` the result is quantized
     into a BlockTensor. ``transpose_b=True`` computes a @ b.T from b's exact
-    values (for tensor cores where both operands are blocked along K)."""
-    sa, fa = _operand(a)
-    sb, fb = _operand(b)
+    values (for tensor cores where both operands are blocked along K).
+
+    Two FPArray operands with an ``acc`` give an FPArray (same values and
+    flags as the list form)."""
+    arrays = (isinstance(a, FPArray) and isinstance(b, FPArray)
+              and out is None and _acc_spec(acc) is not None)
+    if arrays:
+        sa, sb = a.shape, b.shape
+    else:
+        sa, fa = _operand(a)
+        sb, fb = _operand(b)
     if transpose_b and len(sb) >= 2:
         perm = tuple(range(len(sb) - 2)) + (len(sb) - 1, len(sb) - 2)
-        fb, sb = _permute(fb, sb, perm), tuple(sb[p] for p in perm)
+        if arrays:
+            b = b.transpose(*perm)
+        else:
+            fb = _permute(fb, sb, perm)
+        sb = tuple(sb[p] for p in perm)
     a_vec, b_vec = len(sa) == 1, len(sb) == 1
     if a_vec:
         sa = (1,) + sa
@@ -748,6 +722,32 @@ def matmul(a, b, acc: FPFormat | Accumulator | None = None,
     nb = 1
     for d in batch:
         nb *= d
+    spec = _acc_spec(acc)
+    shape = batch + ((m,) if not a_vec else ()) + ((n,) if not b_vec else ())
+    if arrays:
+        r = _core.array_matmul(a, b, nb, m, k, n, bool(batch_a), bool(batch_b), spec, shape or (1,))
+        return r if shape else r[0]
+    res = None
+    if acc is None or spec is not None:
+        res = _core.matmul_reduce(fa, fb, nb, m, k, n, bool(batch_a), bool(batch_b), spec)
+    if res is None:
+        res = _matmul_loop(fa, fb, nb, m, k, n, batch_a, batch_b, acc)
+    result = _nest(res, shape) if shape else res[0]
+    if out is not None:
+        return BlockTensor.quantize(result, out)
+    return result
+
+
+def _acc_spec(acc):
+    """Accumulator parameters for the native reduction (None: not native)."""
+    if isinstance(acc, FPFormat):
+        return (acc, "exact", None, 1, None)
+    if isinstance(acc, Accumulator):
+        return acc._spec()
+    return None
+
+
+def _matmul_loop(fa, fb, nb, m, k, n, batch_a, batch_b, acc):
     res = []
     for bi in range(nb):
         oa = bi * m * k if batch_a else 0
@@ -757,8 +757,4 @@ def matmul(a, b, acc: FPFormat | Accumulator | None = None,
             for j in range(n):
                 col = [fb[ob + t * n + j] for t in range(k)]
                 res.append(_reduce(row, col, acc))
-    shape = batch + ((m,) if not a_vec else ()) + ((n,) if not b_vec else ())
-    result = _nest(res, shape) if shape else res[0]
-    if out is not None:
-        return BlockTensor.quantize(result, out)
-    return result
+    return res

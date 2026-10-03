@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+# Run a command under a hard memory limit, so a runaway test or script is
+# killed alone instead of exhausting the machine:
+#
+#     tools/capped uv run pytest -q
+#     MEM=4G CPUS=4 tools/capped uv run python bench/bench.py
+#
+# With Slurm the command runs as a job (`srun --mem`): its memory and swap
+# are limited by a cgroup of its own, away from the calling shell. Without
+# Slurm, a systemd user scope with MemoryMax does the same; failing that,
+# `ulimit -v` limits the address space. CAPPED=slurm|systemd|ulimit forces
+# one of them. MEM (default 8G) takes a K, M or G suffix; CPUS (default 4)
+# is the number of cores of a Slurm job; TIME (default 4:00:00) its limit.
+set -euo pipefail
+[ $# -gt 0 ] || { sed -n '2,13p' "$0" | cut -c3-; exit 2; }
+
+MEM=${MEM:-8G}
+CPUS=${CPUS:-4}
+TIME=${TIME:-4:00:00}
+case "$MEM" in
+    *[Kk]) kb=${MEM%?} ;;
+    *[Mm]) kb=$(( ${MEM%?} * 1024 )) ;;
+    *[Gg]) kb=$(( ${MEM%?} * 1024 * 1024 )) ;;
+    *) echo "capped: MEM needs a K, M or G suffix, not '$MEM'" >&2; exit 2 ;;
+esac
+
+how=${CAPPED:-}
+if [ -z "$how" ]; then
+    if [ -n "${SLURM_JOB_ID:-}" ]; then how=ulimit        # already inside a job
+    elif command -v srun >/dev/null 2>&1 && sinfo -h >/dev/null 2>&1; then how=slurm
+    elif command -v systemd-run >/dev/null 2>&1 && systemd-run --user --scope -q true 2>/dev/null; then how=systemd
+    else how=ulimit
+    fi
+fi
+
+# The address-space limit goes on in every mode: it turns most runaway
+# allocations into a MemoryError the program can report.
+ulimit -v "$kb" 2>/dev/null || true
+case "$how" in
+    slurm)
+        ulimit -v unlimited 2>/dev/null || true           # srun itself is not the workload
+        exec srun --quiet --ntasks=1 --cpus-per-task="$CPUS" --mem="$(( kb / 1024 ))M" --time="$TIME" \
+            --job-name="${JOB_NAME:-capped}" bash -c 'ulimit -v "$0" 2>/dev/null || true; exec "$@"' "$kb" "$@" ;;
+    systemd)
+        exec systemd-run --user --scope -q -p MemoryMax="${kb}K" -p MemorySwapMax=0 -- "$@" ;;
+    ulimit)
+        exec "$@" ;;
+    *) echo "capped: CAPPED must be slurm, systemd or ulimit, not '$how'" >&2; exit 2 ;;
+esac

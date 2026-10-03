@@ -1,0 +1,87 @@
+# The test suite on the operating systems and CPUs that cannot be reached
+# from one Linux machine: macOS (Apple silicon and Intel), Windows (MSYS2
+# UCRT64: the core needs a compiler with __int128, which MSVC lacks) and
+# native ARM Linux. Linux distributions, C libraries, compilers and emulated
+# architectures are covered locally by tools/in_container.
+#
+# The first job writes the golden corpus on x86-64 Linux; every other job
+# must reproduce it bit for bit (tools/golden_corpus) and pass the suite.
+name: tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  corpus:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install .
+      - run: python tools/golden_corpus generate corpus
+      - uses: actions/upload-artifact@v4
+        with:
+          name: corpus
+          path: corpus
+
+  unix:
+    needs: corpus
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-14, macos-13]
+        python: ["3.12", "3.13"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: corpus
+          path: corpus
+      - run: pip install . ./archive/python pytest numpy
+      # The external references: where a wheel is missing, their tests are skipped.
+      - run: for p in gmpy2 ml-dtypes gfloat apytypes; do pip install --only-binary :all: $p || true; done
+      - run: python tools/golden_corpus verify corpus
+      - name: test suite (the installed build, not the source directory)
+        run: |
+          rm -rf src/verifloat
+          pytest -q -p no:cacheprovider tests -k "not test_edge"
+
+  windows:
+    needs: corpus
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            git
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-cmake
+            mingw-w64-ucrt-x86_64-ninja
+            mingw-w64-ucrt-x86_64-python
+            mingw-w64-ucrt-x86_64-python-pip
+            mingw-w64-ucrt-x86_64-python-numpy
+            mingw-w64-ucrt-x86_64-python-pytest
+      - uses: actions/download-artifact@v4
+        with:
+          name: corpus
+          path: corpus
+      - run: pip install . ./archive/python
+      - run: python tools/golden_corpus verify corpus
+      - name: test suite (the installed build, not the source directory)
+        run: |
+          rm -rf src/verifloat
+          pytest -q -p no:cacheprovider tests -k "not test_edge"

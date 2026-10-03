@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+# Build VeriFloat from this source tree inside a container of another Linux
+# distribution or CPU architecture, and run a command there (default: the
+# test suite). The tree is copied, never modified.
+#
+#     tools/in_container debian:13
+#     tools/in_container --arch arm64 debian:13 pytest -q tests -k "not test_edge"
+#     CXX=clang++ CXXFLAGS=-stdlib=libc++ tools/in_container debian:13
+#
+# Needs podman (rootless is enough). --arch runs a foreign architecture and
+# needs QEMU user-mode emulation registered with binfmt_misc. Environment:
+# PODMAN (the podman command), MEM (memory limit, default 9g), CPUS
+# (default 4), CACHE (a host directory kept between runs: pip downloads and
+# the TestFloat build), CORPUS (a directory of vector files to verify, see
+# tools/golden_corpus), and every VERIFLOAT_* variable is passed through.
+set -euo pipefail
+arch=()
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --arch) arch=(--arch "$2"); shift 2 ;;
+        -h|--help) sed -n '2,15p' "$0" | cut -c3-; exit 0 ;;
+        *) break ;;
+    esac
+done
+[ $# -gt 0 ] || { sed -n '2,15p' "$0" | cut -c3-; exit 2; }
+image=$1; shift
+[ $# -gt 0 ] || set -- pytest -q -p no:cacheprovider tests
+root=$(cd "$(dirname "$0")/.." && pwd)
+# Official images have one repository per architecture (amd64/debian,
+# arm64v8/debian, s390x/debian ...). Naming it keeps images of different
+# architectures from replacing each other under one local tag.
+host=$(uname -m)
+case "${arch[1]:-$host}" in
+    x86_64|amd64) ns=amd64 ;; arm64|aarch64) ns=arm64v8 ;; *) ns=${arch[1]:-$host} ;;
+esac
+case "$image" in
+    docker.io/library/*) pull=docker.io/$ns/${image#docker.io/library/} ;;
+    */*) pull=$image ;;
+    *) pull=docker.io/$ns/$image ;;
+esac
+tag=$(printf '%s' "$image-${arch[1]:-native}-${CXX:-default}${CXXFLAGS:+-$CXXFLAGS}" | tr -c 'A-Za-z0-9._-' '_')
+opts=(--rm "${arch[@]}" --memory "${MEM:-9g}" --memory-swap "${MEM:-9g}" --cpus "${CPUS:-4}"
+      -v "$root:/src:ro" -e "VF_TAG=$tag" -e "CXX=${CXX:-}" -e "CC=${CC:-}" -e "CXXFLAGS=${CXXFLAGS:-}"
+      -e "CMAKE_BUILD_PARALLEL_LEVEL=${CPUS:-4}")
+[ -n "${CACHE:-}" ] && { mkdir -p "$CACHE"; opts+=(-v "$CACHE:/cache"); }
+[ -n "${CORPUS:-}" ] && opts+=(-v "$CORPUS:/corpus:ro")
+while IFS='=' read -r name _; do
+    case "$name" in VERIFLOAT_*) opts+=(-e "$name") ;; esac
+done < <(env)
+exec ${PODMAN:-podman} run "${opts[@]}" "$pull" sh /src/tools/container_entry.sh "$@"

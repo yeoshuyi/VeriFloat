@@ -1,0 +1,14 @@
+[project]
+name = "verifloat-py"
+version = "0.1.0"
+description = "Frozen pure-Python VeriFloat 0.1 (git tag python-v0.1.0), kept as the reference oracle for the C++ core"
+license = "MIT"
+requires-python = ">=3.12"
+dependencies = []
+
+[tool.hatch.build.targets.wheel]
+packages = ["verifloat_py"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

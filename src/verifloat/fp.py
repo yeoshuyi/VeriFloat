@@ -1,3 +1,11 @@
+"""Floating point: formats, rounding modes and the FP type.
+
+FP values and rounding run in the C++ core (``verifloat._core``); this module
+holds the format description (``FPFormat``), the enums, and the few
+operations that are naturally Python (name parsing, the common-format search,
+warning messages).
+"""
+
 from __future__ import annotations
 
 import dataclasses
@@ -8,11 +16,10 @@ import re
 from dataclasses import KW_ONLY, dataclass
 from fractions import Fraction
 
+from . import _core
 from ._warnings import (CastWarning, FPFormatWarning, FPModeWarning,
-                        FPOverflowWarning, FPUnderflowWarning)
+                        FPOverflowWarning, FPUnderflowWarning, IntCastWarning)
 from ._warnings import warn as _warn
-from .sint import INT
-from .uint import UINT
 
 
 def _pow2(k: int) -> Fraction:
@@ -53,6 +60,8 @@ class FPFlags(enum.IntFlag):
 
 
 _F = FPFlags
+_ROUNDINGS = list(Rounding)
+_NAN_MODES = list(NaNMode)
 
 
 # Stochastic rounding draws its random bits from this source (nbits -> int).
@@ -71,18 +80,38 @@ def set_sr_source(source) -> None:
 def _show(x) -> str:
     if x is None:
         return "an irrational result"
+    if x is ...:        # the core did not build it (see fp_finish)
+        return "a value too large to write out"
     try:
         return repr(float(x))
     except OverflowError:
+        pass
+    try:
         return str(x)
+    except ValueError:  # more digits than Python converts to text
+        return _approx(x)
+
+
+def _approx(x) -> str:
+    """Scientific notation for a huge rational, from its leading bits."""
+    x = Fraction(x)
+    n, d = abs(x.numerator), x.denominator
+    sn, sd = max(n.bit_length() - 64, 0), max(d.bit_length() - 64, 0)
+    lg = math.log10((n >> sn) / (d >> sd)) + (sn - sd) * math.log10(2)
+    e = math.floor(lg)
+    return f"about {'-' if x < 0 else ''}{10 ** (lg - e):.6f}e{e:+d}"
 
 
 _NAME_RE = re.compile(r"(u?)e(\d+)m(\d+)((?:, [a-z0-9_-]+(?:=-?[a-z0-9]+)?)*)")
 _INF_NAN_NAME = {True: "ieee", False: "finite", "fn": "fn"}
+_INF_NAN_CODE = {False: 0, True: 1, "fn": 2}
+
+# Equal formats share one id, so the core compares formats in O(1).
+_INTERN: dict[tuple, int] = {}
 
 
 @dataclass(frozen=True)
-class FPFormat:
+class FPFormat(_core.FormatBase):
     """A complete FP format: field widths, bias, signedness and modes.
 
     Calling a format rounds a value into it: ``FPFormat(4, 3)(0.1)``.
@@ -143,32 +172,47 @@ class FPFormat:
             object.__setattr__(self, name, bool(getattr(self, name)))
         if self._max_code < (0 if not self.has_zero else 1):
             raise ValueError(f"format {self} has no positive finite value")
+        if (self.exp_bits > 60 or abs(self.bias) > 1 << 60 or self.mantissa_bits > 1 << 24
+                or self.sr_bits > 1 << 20):
+            raise ValueError("format too large for the C++ core: needs exp_bits <= 60, "
+                             "|bias| <= 2**60, mantissa_bits <= 2**24, sr_bits <= 2**20")
+        key = (self.exp_bits, self.mantissa_bits, self.bias, self.signed,
+               _INF_NAN_CODE[self.inf_nan], self.has_zero, self.saturate, self.wrap,
+               self.ftz, self.rounding, self.sr_bits, self.nan_mode, self.tininess)
+        fid = _INTERN.setdefault(key, len(_INTERN))
+        self._setup(self.exp_bits, self.mantissa_bits, self.bias, self.signed,
+                    _INF_NAN_CODE[self.inf_nan], self.has_zero, self.saturate, self.wrap,
+                    self.ftz, _ROUNDINGS.index(self.rounding), self.sr_bits,
+                    _NAN_MODES.index(self.nan_mode), self.tininess == "before", fid)
 
-    # Construction
-    def __call__(self, value, *, sr_rand: int | None = None) -> "FP":
-        return FP.from_value(value, self, sr_rand=sr_rand)
-
+    # Construction: calling a format (``fmt(value, sr_rand=None)``) rounds a
+    # value into it; that is implemented by the native base class.
     def from_raw(self, raw: int) -> "FP":
-        return FP._from_raw_fmt(raw, self)
+        return _core.fp_from_raw(self, raw)
+
+    def array(self, values) -> "_core.FPArray":
+        """Round nested lists of values into an FPArray of this format."""
+        return _core.FPArray(values, self)
 
     def all_values(self):
         """Yield every encoding of this format in raw-code order."""
+        from_raw = _core.fp_from_raw
         for raw in range(1 << self.size):
-            yield FP._from_raw_fmt(raw, self)
+            yield from_raw(self, raw)
 
     def zero(self, sign: bool = False) -> "FP":
         if not self.has_zero:
             raise ValueError(f"{self} has no zero")
-        return FP._make(sign, 0, 0, self)
+        return _core.fp_make(self, sign, 0, 0)
 
     def max_value(self, sign: bool = False) -> "FP":
         """Largest finite value."""
-        return FP._make(sign, self._max_field, self._max_mant, self)
+        return _core.fp_make(self, sign, self._max_field, self._max_mant)
 
     def inf(self, sign: bool = False) -> "FP":
         if not self.has_inf:
             raise ValueError(f"{self} has no infinity")
-        return FP._make(sign, self._top, 0, self)
+        return _core.fp_make(self, sign, self._top, 0)
 
     def nan(self, sign: bool = False, payload: int | None = None) -> "FP":
         """A NaN: the canonical quiet NaN, or one with the given mantissa."""
@@ -180,7 +224,7 @@ class FPFormat:
             payload = 1 << (self.mantissa_bits - 1)
         elif not payload & self._mask:
             raise ValueError("a NaN payload must be nonzero")
-        return FP._make(sign and self.signed, self._top, payload, self)
+        return _core.fp_make(self, sign and self.signed, self._top, payload)
 
     def replace(self, **changes) -> "FPFormat":
         """Copy with some fields changed. A default bias follows exp_bits."""
@@ -315,6 +359,9 @@ class FPFormat:
             args.append(f"tininess={self.tininess!r}")
         return f"FPFormat({', '.join(args)})"
 
+    def __reduce__(self):
+        return (_rebuild_format, (self.exp_bits, self.mantissa_bits, self.kw))
+
     @classmethod
     def parse(cls, name: str) -> "FPFormat":
         """Inverse of str(): e.g. 'ue4m3, bias=10, fn, saturate, rtz'."""
@@ -347,6 +394,10 @@ class FPFormat:
         return cls(int(m[2]), int(m[3]), **kw)
 
 
+def _rebuild_format(exp_bits, mantissa_bits, kw):
+    return FPFormat(exp_bits, mantissa_bits, **kw)
+
+
 # Presets. OCP formats follow the OCP 8-bit FP / MX specifications.
 E2M1 = FPFormat(2, 1, inf_nan=False)           # OCP FP4 (NVFP4/MXFP4 element)
 E2M3 = FPFormat(2, 3, inf_nan=False)           # OCP FP6
@@ -372,6 +423,8 @@ def _resolve(exp_bits, mantissa_bits, bias, signed, fmt, modes) -> FPFormat:
     return FPFormat(exp_bits, mantissa_bits, bias, signed, **modes)
 
 
+# Pure-Python rounding helpers, kept for code that rounds Python numbers
+# outside the FP type (fixed point, integer quantizers).
 def _round_sig(n: int, d: int, shift: int, neg: bool, rounding: Rounding,
                odd: bool | None = None, sr: int = 0, sr_bits: int = 8):
     """Round n/d / 2**shift to an integer. Returns (sig, inexact).
@@ -443,857 +496,195 @@ def _report(event: str, x, fmt: FPFormat, result: "FP") -> None:
     _warn(_EVENTS[event], msg)
 
 
-def _should_warn(event: str | None, fmt: FPFormat) -> bool:
-    # Unsigned formats warn on every event; signed formats follow standard
-    # FPU behaviour silently, except for the opt-in exponent wrap.
-    return event is not None and (not fmt.signed or event.startswith("wrapped"))
-
-
 _MODE_FIELDS = ("saturate", "wrap", "ftz", "rounding", "sr_bits", "nan_mode", "tininess")
 
 
-class FP:
-    __slots__ = ("_sign", "_exp", "_mantissa", "_format", "_flags", "_unrounded")
+def _common_of(fa: FPFormat, fb: FPFormat) -> FPFormat:
+    """Smallest format holding every value of both formats. Signed if either
+    is; has inf/NaN if either does; the remaining modes come from fa."""
+    if fa == fb:
+        return fa
+    specials = {fa.inf_nan, fb.inf_nan}
+    inf_nan = True if True in specials else ("fn" if "fn" in specials else False)
+    M = max(fa.mantissa_bits, fb.mantissa_bits, 1 if inf_nan is True else 0)
+    # With at least as many mantissa bits and the lower emin, every
+    # finite value of either format (subnormals included) is exact.
+    emin = min(fa.emin, fb.emin)
+    need = max(fa.max, fb.max)
+    E = 2
+    while FPFormat(E, M, 1 - emin, inf_nan=inf_nan).max < need:
+        E += 1
+    return FPFormat(E, M, 1 - emin, fa.signed or fb.signed, inf_nan=inf_nan,
+                    **{k: getattr(fa, k) for k in _MODE_FIELDS})
 
-    def __init__(self, sign: bool, exp: UINT, mantissa: UINT,
-                 bias: int | None = None, signed: bool = True, **modes):
-        if not isinstance(exp, UINT) or not isinstance(mantissa, UINT):
-            raise TypeError("exp and mantissa must be UINT")
-        fmt = FPFormat(exp.bits, mantissa.bits, bias, signed, **modes)
-        if sign and not fmt.signed:
-            raise ValueError("unsigned FP cannot have its sign set")
-        self._sign = bool(sign)
-        self._exp = exp
-        self._mantissa = mantissa
-        self._format = fmt
-        self._flags = FPFlags(0)
-        self._unrounded = None
 
-    # Construction
-    @classmethod
-    def _make(cls, sign: bool, field: int, mant: int, fmt: FPFormat) -> "FP":
-        if sign and not fmt.signed:
-            raise ValueError("unsigned FP cannot have its sign set")
-        x = object.__new__(cls)
-        x._sign = bool(sign)
-        x._exp = UINT(field, fmt.exp_bits)
-        x._mantissa = UINT(mant, fmt.mantissa_bits)
-        x._format = fmt
-        x._flags = FPFlags(0)
-        x._unrounded = None
-        return x
+def _warn_mismatch(fa: FPFormat, fb: FPFormat, fmt: FPFormat) -> None:
+    if ((fa.exp_bits, fa.mantissa_bits, fa.bias)
+            != (fb.exp_bits, fb.mantissa_bits, fb.bias)):
+        _warn(FPFormatWarning,
+              f"mixing FP formats {fa} and {fb}, promoted to {fmt}")
+    if fa.signed != fb.signed:
+        _warn(FPModeWarning, f"mismatched signed: {fa} (left) vs {fb} "
+              f"(right), result is signed")
+    if fa.inf_nan != fb.inf_nan:
+        _warn(FPModeWarning, f"mismatched inf_nan: {_INF_NAN_NAME[fa.inf_nan]} "
+              f"(left) vs {_INF_NAN_NAME[fb.inf_nan]} (right), result is "
+              f"{_INF_NAN_NAME[fmt.inf_nan]}")
+    if fa.has_zero != fb.has_zero:
+        _warn(FPModeWarning, f"mismatched has_zero: {fa.has_zero} (left) vs "
+              f"{fb.has_zero} (right), result has zero")
+    for tag in _MODE_FIELDS:
+        lv, rv = getattr(fa, tag), getattr(fb, tag)
+        if lv != rv:
+            show = (lambda v: v.value) if isinstance(lv, enum.Enum) else (lambda v: v)
+            _warn(FPModeWarning, f"mismatched {tag}: {show(lv)} (left) vs "
+                  f"{show(rv)} (right), using {show(lv)}")
 
-    @classmethod
-    def _from_raw_fmt(cls, raw: int, fmt: FPFormat) -> "FP":
-        E, M = fmt.exp_bits, fmt.mantissa_bits
-        s = fmt.signed and (raw >> (E + M)) & 1
-        return cls._make(bool(s), raw >> M, raw, fmt)
 
-    @classmethod
-    def from_value(cls, value, exp_bits: int | FPFormat = 2, mantissa_bits: int = 1,
-                   bias: int | None = None, signed: bool = True, *,
-                   fmt: FPFormat | None = None, sr_rand: int | None = None,
-                   **modes) -> "FP":
-        """Round a number (int, float, Fraction, FP, UINT/INT) into a format.
-        ``sr_rand`` supplies the random bits for Rounding.SR explicitly."""
-        fmt = _resolve(exp_bits, mantissa_bits, bias, signed, fmt, modes)
-        if isinstance(value, FP):
-            return value._convert_to(fmt, sr_rand)
-        if isinstance(value, UINT):
-            value = value.val
-        elif not isinstance(value, (int, float, Fraction)) and hasattr(value, "exact"):
-            value = value.exact        # e.g. a FIXED value
-        if isinstance(value, float) and not math.isfinite(value):
-            return cls._finish(*cls._special_in(value, fmt), fmt)
-        zero_sign = isinstance(value, float) and math.copysign(1.0, value) < 0
-        return cls._encode(Fraction(value), fmt, zero_sign, sr_rand)
+def _cast_warn(other, fmt: FPFormat, value: float, flags: FPFlags) -> None:
+    try:
+        shown = repr(other)
+    except ValueError:      # more digits than Python converts to text
+        shown = _approx(other)
+    _warn(CastWarning, f"implicit cast of {shown} to {fmt} is lossy: "
+          f"{value!r} ({flags.name})")
 
-    @classmethod
-    def zero(cls, exp_bits: int | FPFormat = 2, mantissa_bits: int = 1,
-             sign: bool = False, bias=None, signed=True, *, fmt=None,
-             **modes) -> "FP":
-        return _resolve(exp_bits, mantissa_bits, bias, signed, fmt, modes).zero(sign)
 
-    @classmethod
-    def max_value(cls, exp_bits: int | FPFormat = 2, mantissa_bits: int = 1,
-                  sign: bool = False, bias=None, signed=True, *, fmt=None,
-                  **modes) -> "FP":
-        return _resolve(exp_bits, mantissa_bits, bias, signed, fmt,
-                        modes).max_value(sign)
+_core._init(Fraction, [FPFlags(i) for i in range(32)], _ROUNDINGS, _NAN_MODES,
+            _warn, IntCastWarning, _report, _warn_mismatch, _common_of, _cast_warn,
+            _sr_state, FPFormat)
 
-    @classmethod
-    def from_raw(cls, raw: int, exp_bits: int | FPFormat = 2, mantissa_bits: int = 1,
-                 bias: int | None = None, signed: bool = True, *,
-                 fmt: FPFormat | None = None, **modes) -> "FP":
-        return cls._from_raw_fmt(raw, _resolve(exp_bits, mantissa_bits, bias,
-                                               signed, fmt, modes))
 
-    @classmethod
-    def all_values(cls, exp_bits: int | FPFormat = 2, mantissa_bits: int = 1,
-                   bias: int | None = None, signed: bool = True, *,
-                   fmt: FPFormat | None = None, **modes):
-        """Yield every encoding of a format in raw-code order."""
-        return _resolve(exp_bits, mantissa_bits, bias, signed, fmt,
-                        modes).all_values()
+# ---------------------------------------------------------------- FP
+# The type is native; the constructors that take format fields, and a few
+# rarely used helpers, are added here.
 
-    # Getters
-    @property
-    def format(self) -> FPFormat:
-        return self._format
+FP = _core.FP
 
-    @property
-    def sign(self) -> bool:
-        return self._sign
 
-    @property
-    def exp(self) -> UINT:
-        return self._exp
-
-    @property
-    def mantissa(self) -> UINT:
-        return self._mantissa
-
-    def __getattr__(self, name):
-        # Format fields (exp_bits, bias, rounding, ...) read through.
-        if name in FPFormat.__dataclass_fields__ and name != "_":
-            return getattr(self._format, name)
-        raise AttributeError(name)
-
-    @property
-    def size(self) -> int:
-        """Storage width in bits: [sign +] exponent + mantissa."""
-        return self._format.size
-
-    @property
-    def raw(self) -> int:
-        return ((int(self._sign) << (self.exp_bits + self.mantissa_bits))
-                | (self._exp.val << self.mantissa_bits)
-                | self._mantissa.val)
-
-    # Classification
-    @property
-    def is_nan(self) -> bool:
-        f = self._format
-        if not f.has_nan or self._exp.val != f._top:
-            return False
-        if f.inf_nan == "fn":
-            return self._mantissa.val == f._mask
-        return self._mantissa.val != 0
-
-    @property
-    def is_inf(self) -> bool:
-        return (self._format.has_inf and self._exp.val == self._format._top
-                and self._mantissa.val == 0)
-
-    @property
-    def is_finite(self) -> bool:
-        return not (self.is_nan or self.is_inf)
-
-    @property
-    def is_snan(self) -> bool:
-        """Signaling NaN: IEEE formats, quiet bit (mantissa MSB) clear."""
-        return (self.is_nan and self._format.inf_nan is True
-                and not self._mantissa.val >> (self.mantissa_bits - 1))
-
-    @property
-    def is_zero(self) -> bool:
-        return self.is_finite and self.exact == 0
-
-    @property
-    def is_subnormal(self) -> bool:
-        return (self._format.has_zero and self._exp.val == 0
-                and self._mantissa.val != 0)
-
-    # Verification data
-    @property
-    def flags(self) -> FPFlags:
-        """Status flags raised by the operation that produced this value."""
-        return self._flags
-
-    @property
-    def unrounded(self):
-        """Infinitely precise result before rounding: a Fraction, +-inf as a
-        float, or None (NaN results and values built from bits)."""
-        return self._unrounded
-
-    @property
-    def exact(self) -> Fraction:
-        """The exact value this encoding represents (finite values only)."""
-        if not self.is_finite:
-            raise ValueError(f"{self!r} is not finite")
-        f = self._format
-        M, b, m = f.mantissa_bits, self._exp.val, self._mantissa.val
-        if b == 0 and f.has_zero:
-            if f.ftz:  # denormals-are-zero on input
-                return Fraction(0)
-            v = m * _pow2(1 - f.bias - M)
-        else:
-            v = ((1 << M) | m) * _pow2(b - f.bias - M)
-        return -v if self._sign else v
-
-    def _key(self):
-        """Value for ordering: exact, or +-inf as a float (not for NaN)."""
-        if self.is_inf:
-            return -math.inf if self._sign else math.inf
-        return self.exact
-
-    @property
-    def ulp(self) -> Fraction:
-        """Spacing of adjacent encodings in this value's binade."""
-        f = self._format
-        return _pow2(max(self._exp.val, f._min_field) - f.bias - f.mantissa_bits)
-
-    def error_ulps(self, ref=None) -> Fraction:
-        """(exact - ref) in ulps of this value; ref defaults to unrounded."""
-        if ref is None:
-            ref = self._unrounded
-            if ref is None:
-                raise ValueError("no unrounded value; pass ref explicitly")
-        if isinstance(ref, FP):
-            ref = ref.exact
-        return (self.exact - Fraction(ref)) / self.ulp
-
-    def _fmt(self) -> FPFormat:
-        return self._format
-
-    # Rounding core (finite values)
-    @classmethod
-    def _overflow(cls, sign: bool, fmt: FPFormat):
-        """Result of an overflow, per IEEE 754 7.4: inf or max by rounding
-        direction (NaN instead of inf in 'fn' formats)."""
-        to_inf = {Rounding.RNE: True, Rounding.RNA: True, Rounding.SR: True,
-                  Rounding.RTZ: False, Rounding.RUP: not sign,
-                  Rounding.RDN: sign}[fmt.rounding]
-        if not fmt.has_nan or fmt.saturate or not to_inf:
-            return cls._make(sign, fmt._max_field, fmt._max_mant, fmt), "saturated"
-        if fmt.has_inf:
-            return cls._make(sign, fmt._top, 0, fmt), "overflowed"
-        return fmt.nan(sign), "overflowed"
-
-    @classmethod
-    def _no_zero(cls, fmt: FPFormat):
-        """A zero (or negative-into-unsigned) result in a format without zero."""
-        if not fmt.has_nan:
-            raise ValueError(f"{fmt} has no zero and no NaN to return instead")
-        return fmt.nan(), _F.INVALID, None
-
-    @classmethod
-    def _round(cls, x: Fraction, fmt: FPFormat, zero_sign: bool = False,
-               sr: int | None = None):
-        """Round finite x into fmt. Returns (result, flags, event)."""
-        M, bias = fmt.mantissa_bits, fmt.bias
-        emin, emax = fmt.emin, fmt.emax
-        if x == 0:
-            if not fmt.has_zero:
-                return cls._no_zero(fmt)
-            return cls._make(zero_sign and fmt.signed, 0, 0, fmt), _F(0), None
-        if x < 0 and not fmt.signed:
-            if not fmt.has_zero:
-                return cls._no_zero(fmt)
-            # Unsigned formats clamp negative results to zero.
-            return cls._make(False, 0, 0, fmt), _F.UNDERFLOW | _F.INEXACT, "clamped"
-
-        if fmt.rounding is Rounding.SR and sr is None:
-            sr = _sr_state["source"](fmt.sr_bits)
-        sr = sr or 0
-        sign = x < 0
-        n, d = abs(x).numerator, abs(x).denominator
-        e = _floor_log2(n, d)
-
-        def rnd(exp):
-            # Zero-width mantissa: ties-to-even uses the code's parity.
-            odd = None
-            if M == 0:
-                trunc = (n << max(0, -exp)) // (d << max(0, exp))
-                odd = bool(trunc) and bool((exp + bias) & 1)
-            s, inexact = _round_sig(n, d, exp - M, sign, fmt.rounding, odd, sr,
-                                    fmt.sr_bits)
-            if s >> (M + 1):
-                return s >> 1, exp + 1, inexact
-            return s, exp, inexact
-
-        # Tininess: before rounding, or after rounding to M bits with an
-        # unbounded exponent (IEEE 754-2019 7.5).
-        e_after = rnd(e)[1]
-        tiny = (e if fmt.tininess == "before" else e_after) < emin
-
-        gradual = fmt.has_zero and not (fmt.wrap or fmt.ftz)
-        sig, e, inexact = rnd(max(e, emin) if gradual else e)
-
-        if fmt.ftz and tiny:
-            return cls._make(sign, 0, 0, fmt), _F.UNDERFLOW | _F.INEXACT, "flushed"
-        # In 'fn' formats the all-ones code of the top binade is NaN.
-        over = e > emax or (e == emax and (sig & fmt._mask) > fmt._max_mant)
-        if over:
-            if fmt.wrap:
-                result = cls._make(sign, e + bias, sig, fmt)  # UINT wraps field
-                return result, _F.OVERFLOW | _F.INEXACT, "wrapped-up"
-            result, event = cls._overflow(sign, fmt)
-            return result, _F.OVERFLOW | _F.INEXACT, event
-        if e < emin:
-            if fmt.wrap:
-                result = cls._make(sign, e + bias, sig, fmt)
-                return result, _F.UNDERFLOW | _F.INEXACT, "wrapped-down"
-            # No zero and no subnormals: the smallest value is the floor.
-            result = cls._make(sign, fmt._min_field, 0, fmt)
-            return result, _F.UNDERFLOW | _F.INEXACT, "underflowed"
-        field = e + bias if (sig >> M or not fmt.has_zero) else 0
-        result = cls._make(sign, field, sig, fmt)
-        flags, event = _F(0), None
-        if inexact:
-            flags |= _F.INEXACT
-            if tiny and (gradual or not fmt.has_zero):
-                flags |= _F.UNDERFLOW
-                event = "underflowed"
-        return result, flags, event
-
-    @classmethod
-    def _finish(cls, result: "FP", flags: FPFlags, event, unrounded, fmt) -> "FP":
-        result._flags = flags
-        result._unrounded = unrounded
-        if _should_warn(event, fmt):
-            _report(event, unrounded, fmt, result)
-        return result
-
-    @classmethod
-    def _encode(cls, x: Fraction, fmt: FPFormat, zero_sign: bool = False,
-                sr: int | None = None) -> "FP":
-        result, flags, event = cls._round(x, fmt, zero_sign, sr)
-        return cls._finish(result, flags, event, x, fmt)
-
-    # Special values (inf / NaN)
-    def _nan_to(self, fmt: FPFormat):
-        """This NaN re-encoded in fmt: canonical, or payload kept and quieted."""
-        invalid = _F.INVALID if self.is_snan else _F(0)
-        if not fmt.has_nan:
-            raise ValueError(f"NaN is not representable in {fmt}")
-        keep = fmt.nan_mode is not NaNMode.CANONICAL
-        if not keep or fmt.inf_nan == "fn":
-            return fmt.nan(self._sign and keep), invalid
-        payload = (self._mantissa.val if self.inf_nan is True and self.mantissa_bits
-                   else 1 << max(self.mantissa_bits - 1, 0))
-        shift = fmt.mantissa_bits - max(self.mantissa_bits, 1)
-        payload = payload << shift if shift >= 0 else payload >> -shift
-        payload |= 1 << (fmt.mantissa_bits - 1)  # quiet it
-        return fmt.nan(self._sign, payload), invalid
-
-    @classmethod
-    def _default_nan(cls, fmt: FPFormat) -> "FP":
-        return fmt.nan(fmt.nan_mode is NaNMode.X86)
-
-    @classmethod
-    def _nan_result(cls, fmt: FPFormat, *operands: "FP", invalid: bool = False):
-        """NaN produced by an operation. Returns (result, flags)."""
-        flags = _F.INVALID if invalid or any(o.is_snan for o in operands) else _F(0)
-        if not fmt.has_nan:
-            raise ValueError(f"invalid operation: NaN is not representable in {fmt}")
-        nans = [o for o in operands if o.is_nan]
-        if fmt.nan_mode is not NaNMode.CANONICAL and nans:
-            src = nans[0]
-            if fmt.nan_mode is NaNMode.ARM:
-                src = next((o for o in nans if o.is_snan), src)
-            return src._nan_to(fmt)[0], flags
-        return cls._default_nan(fmt), flags
-
-    @classmethod
-    def _inf_result(cls, sign: bool, fmt: FPFormat):
-        """An exact infinity delivered into fmt. Returns (result, flags, event)."""
-        if sign and not fmt.signed:
-            if not fmt.has_zero:
-                return cls._no_zero(fmt)
-            return cls._make(False, 0, 0, fmt), _F.UNDERFLOW | _F.INEXACT, "clamped"
-        if fmt.has_inf and not fmt.saturate:
-            return cls._make(sign, fmt._top, 0, fmt), _F(0), None
-        if fmt.has_nan and not fmt.saturate:  # 'fn': no infinity -> NaN
-            return fmt.nan(sign), _F.INVALID, None
-        return fmt.max_value(sign), _F.OVERFLOW | _F.INEXACT, "saturated"
-
-    @classmethod
-    def _special_in(cls, value: float, fmt: FPFormat):
-        """Python float inf/NaN into fmt: (result, flags, event, unrounded)."""
-        if math.isnan(value):
-            if not fmt.has_nan:
-                raise ValueError(f"NaN is not representable in {fmt}")
-            keep = fmt.nan_mode is not NaNMode.CANONICAL
-            return (fmt.nan(math.copysign(1, value) < 0 and keep), _F(0), None, None)
-        return (*cls._inf_result(value < 0, fmt), value)
-
-    def _convert_to(self, fmt: FPFormat, sr: int | None = None) -> "FP":
-        if self.is_nan:
-            result, flags = self._nan_to(fmt)
-            return FP._finish(result, flags, None, None, fmt)
-        if self.is_inf:
-            v = -math.inf if self._sign else math.inf
-            return FP._finish(*FP._inf_result(self._sign, fmt), v, fmt)
-        return FP._encode(self.exact, fmt, self._sign, sr)
-
-    def convert(self, exp_bits: int | FPFormat = 2, mantissa_bits: int = 1,
+def _from_value(cls, value, exp_bits: int | FPFormat = 2, mantissa_bits: int = 1,
                 bias: int | None = None, signed: bool = True, *,
-                fmt: FPFormat | None = None, sr_rand: int | None = None,
-                **modes) -> "FP":
-        return self._convert_to(_resolve(exp_bits, mantissa_bits, bias, signed,
-                                         fmt, modes), sr_rand)
+                fmt: FPFormat | None = None, sr_rand: int | None = None, **modes) -> FP:
+    """Round a number (int, float, Fraction, FP, UINT/INT) into a format.
+    ``sr_rand`` supplies the random bits for Rounding.SR explicitly."""
+    return _core.fp_from_value(value, _resolve(exp_bits, mantissa_bits, bias, signed, fmt, modes),
+                               sr_rand)
 
-    # Mixed formats
-    @staticmethod
-    def _common_fmt(a: "FP", b: "FP") -> FPFormat:
-        """Smallest format holding every value of both a's and b's formats.
-        Signed if either is; has inf/NaN if either does; the remaining
-        modes come from the left operand."""
-        return FP._common_of(a._format, b._format)
 
-    @staticmethod
-    def _common_of(fa: FPFormat, fb: FPFormat) -> FPFormat:
-        if fa == fb:
-            return fa
-        specials = {fa.inf_nan, fb.inf_nan}
-        inf_nan = True if True in specials else ("fn" if "fn" in specials else False)
-        M = max(fa.mantissa_bits, fb.mantissa_bits, 1 if inf_nan is True else 0)
-        # With at least as many mantissa bits and the lower emin, every
-        # finite value of either format (subnormals included) is exact.
-        emin = min(fa.emin, fb.emin)
-        need = max(fa.max, fb.max)
-        E = 2
-        while FPFormat(E, M, 1 - emin, inf_nan=inf_nan).max < need:
-            E += 1
-        return FPFormat(E, M, 1 - emin, fa.signed or fb.signed, inf_nan=inf_nan,
-                        **{k: getattr(fa, k) for k in _MODE_FIELDS})
+def _zero(cls, exp_bits: int | FPFormat = 2, mantissa_bits: int = 1,
+          sign: bool = False, bias=None, signed=True, *, fmt=None, **modes) -> FP:
+    return _resolve(exp_bits, mantissa_bits, bias, signed, fmt, modes).zero(sign)
 
-    @staticmethod
-    def _warn_mismatch(fa: FPFormat, fb: FPFormat, fmt: FPFormat) -> None:
-        if ((fa.exp_bits, fa.mantissa_bits, fa.bias)
-                != (fb.exp_bits, fb.mantissa_bits, fb.bias)):
-            _warn(FPFormatWarning,
-                  f"mixing FP formats {fa} and {fb}, promoted to {fmt}")
-        if fa.signed != fb.signed:
-            _warn(FPModeWarning, f"mismatched signed: {fa} (left) vs {fb} "
-                  f"(right), result is signed")
-        if fa.inf_nan != fb.inf_nan:
-            _warn(FPModeWarning, f"mismatched inf_nan: {_INF_NAN_NAME[fa.inf_nan]} "
-                  f"(left) vs {_INF_NAN_NAME[fb.inf_nan]} (right), result is "
-                  f"{_INF_NAN_NAME[fmt.inf_nan]}")
-        if fa.has_zero != fb.has_zero:
-            _warn(FPModeWarning, f"mismatched has_zero: {fa.has_zero} (left) vs "
-                  f"{fb.has_zero} (right), result has zero")
-        for tag in _MODE_FIELDS:
-            lv, rv = getattr(fa, tag), getattr(fb, tag)
-            if lv != rv:
-                show = (lambda v: v.value) if isinstance(lv, enum.Enum) else (lambda v: v)
-                _warn(FPModeWarning, f"mismatched {tag}: {show(lv)} (left) vs "
-                      f"{show(rv)} (right), using {show(lv)}")
 
-    def _coerce(self, other):
-        """Return (self, other, fmt) with both FPs exact in fmt, or None."""
-        if isinstance(other, FP):
-            fmt = FP._common_fmt(self, other)
-            if self._format != other._format:
-                FP._warn_mismatch(self._format, other._format, fmt)
-            return self._widen(fmt), other._widen(fmt), fmt
-        if isinstance(other, (int, float, Fraction)) and not isinstance(other, bool):
-            return self, self._cast_scalar(other), self._format
-        return None
+def _max_value(cls, exp_bits: int | FPFormat = 2, mantissa_bits: int = 1,
+               sign: bool = False, bias=None, signed=True, *, fmt=None, **modes) -> FP:
+    return _resolve(exp_bits, mantissa_bits, bias, signed, fmt, modes).max_value(sign)
 
-    def _coerce3(self, b, c):
-        """Common format and widened copies of self, b, c (for fma)."""
-        b = b if isinstance(b, FP) else self._cast_scalar(b)
-        c = c if isinstance(c, FP) else self._cast_scalar(c)
-        f_ab = FP._common_of(self._format, b._format)
-        if self._format != b._format:
-            FP._warn_mismatch(self._format, b._format, f_ab)
-        fmt = FP._common_of(f_ab, c._format)
-        if f_ab != c._format:
-            FP._warn_mismatch(f_ab, c._format, fmt)
-        return self._widen(fmt), b._widen(fmt), c._widen(fmt), fmt
 
-    def _cast_scalar(self, other) -> "FP":
-        """Implicitly cast a Python number into this value's format. Warns
-        with CastWarning only when the cast changes the value."""
-        fmt = self._format
-        if isinstance(other, float) and not math.isfinite(other):
-            target = fmt if fmt.signed or not other < 0 else fmt.replace(signed=True)
-            b, flags, _, _ = FP._special_in(other, target)
-        else:
-            zero_sign = isinstance(other, float) and math.copysign(1.0, other) < 0
-            x = Fraction(other)
-            # A negative literal keeps its sign even against an unsigned
-            # format, so that e.g. unsigned - 1 is not clamped to unsigned - 0.
-            target = fmt if fmt.signed or x >= 0 else fmt.replace(signed=True)
-            if x == 0 and not target.has_zero:
-                target = target.replace(has_zero=True)
-            b, flags, _ = FP._round(x, target, zero_sign)
-        if flags:
-            _warn(CastWarning, f"implicit cast of {other!r} to {fmt} is lossy: "
-                  f"{float(b)!r} ({flags.name})")
-        return b
+def _from_raw(cls, raw: int, exp_bits: int | FPFormat = 2, mantissa_bits: int = 1,
+              bias: int | None = None, signed: bool = True, *,
+              fmt: FPFormat | None = None, **modes) -> FP:
+    return _core.fp_from_raw(_resolve(exp_bits, mantissa_bits, bias, signed, fmt, modes), raw)
 
-    def _widen(self, fmt: FPFormat) -> "FP":
-        """Re-encode exactly into a (wider) common format, keeping the sign.
-        The copy uses gradual underflow and no wrap/ftz, so no operand is
-        altered (e.g. a subnormal is not read as 0 because the *left*
-        operand has ftz); the op result is still rounded with fmt's modes."""
-        if self._format == fmt:
-            return self
-        plain = fmt.replace(wrap=False, ftz=False, saturate=False, has_zero=True,
-                            rounding=Rounding.RNE)
-        if self.is_nan:
-            # Keep the payload (and signaling state) so the operation itself
-            # raises INVALID; widening never shrinks the mantissa.
-            if plain.inf_nan == "fn" or self.inf_nan == "fn" or not self.mantissa_bits:
-                return plain.nan(self._sign)
-            payload = self._mantissa.val << (plain.mantissa_bits - self.mantissa_bits)
-            return FP._make(self._sign and plain.signed, plain._top, payload, plain)
-        if self.is_inf:
-            return FP._make(self._sign, plain._top, 0, plain)
-        return FP._round(self.exact, plain, self._sign)[0]
 
-    def _fields(self):
-        return self._sign, self._exp.val, self._mantissa.val
+def _all_values(cls, exp_bits: int | FPFormat = 2, mantissa_bits: int = 1,
+                bias: int | None = None, signed: bool = True, *,
+                fmt: FPFormat | None = None, **modes):
+    """Yield every encoding of a format in raw-code order."""
+    return _resolve(exp_bits, mantissa_bits, bias, signed, fmt, modes).all_values()
 
-    # Arithmetic
-    def _binop(self, other, op, reverse=False):
-        c = self._coerce(other)
-        if c is None:
-            return NotImplemented
-        a, b, fmt = c
-        if reverse:
-            a, b = b, a
-        return FP._arith(op, a, b, fmt)
 
-    @staticmethod
-    def _sum_zero_sign(sa: bool, sb: bool, fmt: FPFormat) -> bool:
-        """IEEE 754 6.3: an exact zero sum of opposite-signed operands is +0,
-        except -0 when rounding toward negative."""
-        return sa if sa == sb else fmt.rounding is Rounding.RDN
+def _convert(self, exp_bits: int | FPFormat = 2, mantissa_bits: int = 1,
+             bias: int | None = None, signed: bool = True, *,
+             fmt: FPFormat | None = None, sr_rand: int | None = None, **modes) -> FP:
+    return self._convert_to(_resolve(exp_bits, mantissa_bits, bias, signed, fmt, modes), sr_rand)
 
-    @staticmethod
-    def _arith(op: str, a: "FP", b: "FP", fmt: FPFormat) -> "FP":
-        """a op b rounded into fmt, following IEEE 754 for inf/NaN operands."""
-        if a.is_nan or b.is_nan:
-            return FP._finish(*FP._nan_result(fmt, a, b), None, None, fmt)
-        sa, sb = a.sign, b.sign
-        if op in "+-":
-            sb ^= op == "-"
-            if a.is_inf and b.is_inf and sa != sb:     # inf - inf
-                return FP._finish(*FP._nan_result(fmt, invalid=True), None, None, fmt)
-            if a.is_inf or b.is_inf:
-                s = sa if a.is_inf else sb
-                return FP._finish(*FP._inf_result(s, fmt), -math.inf if s else math.inf, fmt)
-            x = a.exact + b.exact if op == "+" else a.exact - b.exact
-            return FP._encode(x, fmt, FP._sum_zero_sign(sa, sb, fmt))
-        s = sa != sb
-        if op == "*":
-            if a.is_inf or b.is_inf:
-                if a.is_zero or b.is_zero:             # 0 * inf
-                    return FP._finish(*FP._nan_result(fmt, invalid=True), None, None, fmt)
-                return FP._finish(*FP._inf_result(s, fmt), -math.inf if s else math.inf, fmt)
-            return FP._encode(a.exact * b.exact, fmt, s)
-        # division
-        if a.is_inf and b.is_inf:                      # inf / inf
-            return FP._finish(*FP._nan_result(fmt, invalid=True), None, None, fmt)
-        if a.is_inf:
-            return FP._finish(*FP._inf_result(s, fmt), -math.inf if s else math.inf, fmt)
-        if b.is_inf:
-            return FP._encode(Fraction(0), fmt, s)
-        if b.is_zero:
-            if not fmt.has_nan:
-                raise ZeroDivisionError(f"FP division by zero in {fmt}")
-            if a.is_zero:                              # 0 / 0
-                return FP._finish(*FP._nan_result(fmt, invalid=True), None, None, fmt)
-            r, flags, event = FP._inf_result(s, fmt)
-            return FP._finish(r, flags | _F.DIVZERO, event, -math.inf if s else math.inf, fmt)
-        return FP._encode(a.exact / b.exact, fmt, s)
 
-    def __add__(self, o):       return self._binop(o, "+")
-    def __radd__(self, o):      return self._binop(o, "+", True)
-    def __sub__(self, o):       return self._binop(o, "-")
-    def __rsub__(self, o):      return self._binop(o, "-", True)
-    def __mul__(self, o):       return self._binop(o, "*")
-    def __rmul__(self, o):      return self._binop(o, "*", True)
-    def __truediv__(self, o):   return self._binop(o, "/")
-    def __rtruediv__(self, o):  return self._binop(o, "/", True)
+def _ulp(self) -> Fraction:
+    """Spacing of adjacent encodings in this value's binade."""
+    f = self.format
+    return _pow2(max(self.exp.val, f._min_field) - f.bias - f.mantissa_bits)
 
-    def fma(self, b, c) -> "FP":
-        """Fused multiply-add: self * b + c with a single rounding."""
-        a, b, c, fmt = self._coerce3(b, c)
-        fin = lambda r: FP._finish(*r, None, None, fmt)
-        if a.is_nan or b.is_nan:
-            if fmt.nan_mode is NaNMode.ARM and c.is_snan:
-                # ARM picks among (a, b) first, then against c, so a
-                # signaling c wins over the (by then quiet) a/b NaN.
-                return fin((c._nan_to(fmt)[0], _F.INVALID))
-            return fin(FP._nan_result(fmt, a, b, c))
-        s = a.sign != b.sign
-        if (a.is_inf and b.is_zero) or (a.is_zero and b.is_inf):
-            # IEEE 754-2019 7.2: 0 * inf + c is invalid; when c is a quiet
-            # NaN, signaling is implementation-defined. RISC-V and ARM signal
-            # (ARM returns a signaling c, quieted); x86 hardware does not and
-            # returns c.
-            if fmt.nan_mode is NaNMode.X86 and c.is_nan and not c.is_snan:
-                return fin((c._nan_to(fmt)[0], _F(0)))
-            if fmt.nan_mode is NaNMode.ARM and c.is_snan:
-                return fin((c._nan_to(fmt)[0], _F.INVALID))
-            return fin((FP._default_nan(fmt), _F.INVALID))
-        if c.is_nan:
-            return fin(FP._nan_result(fmt, c))
-        if a.is_inf or b.is_inf:
-            if c.is_inf and c.sign != s:
-                return fin(FP._nan_result(fmt, invalid=True))
-            return FP._finish(*FP._inf_result(s, fmt), -math.inf if s else math.inf, fmt)
-        if c.is_inf:
-            return FP._finish(*FP._inf_result(c.sign, fmt),
-                              -math.inf if c.sign else math.inf, fmt)
-        x = a.exact * b.exact + c.exact
-        return FP._encode(x, fmt, FP._sum_zero_sign(s, c.sign, fmt))
 
-    def sqrt(self) -> "FP":
-        """Square root, correctly rounded (IEEE 754 5.4.1)."""
-        fmt = self._format
-        if self.is_nan:
-            return FP._finish(*FP._nan_result(fmt, self), None, None, fmt)
-        if self.is_zero:     # sqrt(-0) = -0; a DAZ subnormal reads as zero
-            return FP._make(self._sign, 0, 0, fmt)
-        if self._sign:
-            return FP._finish(*FP._nan_result(fmt, invalid=True), None, None, fmt)
-        if self.is_inf:
-            return FP._make(*self._fields(), fmt)
-        x = self.exact
-        n, d = x.numerator, x.denominator
-        # Enough bits below the result's last place that a sticky half-bit
-        # decides rounding exactly (as hardware does with a sticky bit).
-        e_s = _floor_log2(n, d) // 2
-        p = max(0, fmt.mantissa_bits + fmt.sr_bits + 4 - min(e_s, fmt.emin))
-        scaled, rem = divmod(n << (2 * p), d)
-        r = math.isqrt(scaled)
-        exact = rem == 0 and r * r == scaled
-        y = Fraction(r, 1 << p) if exact else Fraction(2 * r + 1, 1 << (p + 1))
-        result, flags, event = FP._round(y, fmt)
-        if not exact:
-            flags |= _F.INEXACT
-        return FP._finish(result, flags, event, y if exact else None, fmt)
+def _error_ulps(self, ref=None) -> Fraction:
+    """(exact - ref) in ulps of this value; ref defaults to unrounded."""
+    if ref is None:
+        ref = self.unrounded
+        if ref is None:
+            raise ValueError("no unrounded value; pass ref explicitly")
+    if isinstance(ref, FP):
+        ref = ref.exact
+    return (self.exact - Fraction(ref)) / self.ulp
 
-    # IEEE 754-2019 9.6: minimum/maximum and minimumNumber/maximumNumber
-    def _minmax(self, other, pick_max: bool, number: bool) -> "FP":
-        c = self._coerce(other)
-        if c is None:
-            raise TypeError(f"cannot compare FP with {type(other).__name__}")
-        a, b, fmt = c
-        snan = a.is_snan or b.is_snan
-        if a.is_nan or b.is_nan:
-            if number and not (a.is_nan and b.is_nan):
-                r = b if a.is_nan else a
-                flags = _F.INVALID if snan else _F(0)
-                out = FP._make(r.sign, 0, 0, fmt) if r.is_zero else FP._make(*r._fields(), fmt)
-                return FP._finish(out, flags, None, None, fmt)
-            return FP._finish(*FP._nan_result(fmt, a, b), None, None, fmt)
-        ka, kb = a._key(), b._key()
-        if ka == kb:  # -0 is less than +0
-            pick_a = (a.sign and not b.sign) != pick_max
-        else:
-            pick_a = (ka > kb) == pick_max
-        r = a if pick_a else b
-        if r.is_zero:        # a DAZ subnormal reads as zero
-            return FP._make(r.sign, 0, 0, fmt)
-        return FP._make(*r._fields(), fmt)
 
-    def minimum(self, other) -> "FP":
-        return self._minmax(other, False, False)
+def _key(self):
+    """Value for ordering: exact, or +-inf as a float (not for NaN)."""
+    if self.is_inf:
+        return -math.inf if self.sign else math.inf
+    return self.exact
 
-    def maximum(self, other) -> "FP":
-        return self._minmax(other, True, False)
 
-    def minimum_number(self, other) -> "FP":
-        """minimumNumber: a NaN operand is ignored (RISC-V fmin)."""
-        return self._minmax(other, False, True)
+def _restore(fmt: FPFormat, raw: int, flags: int, unrounded) -> FP:
+    """Unpickle an FP (see FP.__reduce__)."""
+    return _core.fp_restore(fmt, raw, flags, unrounded)
 
-    def maximum_number(self, other) -> "FP":
-        """maximumNumber: a NaN operand is ignored (RISC-V fmax)."""
-        return self._minmax(other, True, True)
 
-    # Integer conversions and rounding to integral
-    _INT_INVALID = {
-        # Integer returned for (NaN, positive overflow, negative overflow)
-        NaNMode.CANONICAL: ("max", "max", "min"),   # RISC-V fcvt
-        NaNMode.PROPAGATE: ("max", "max", "min"),
-        NaNMode.X86: ("x86", "x86", "x86"),          # "integer indefinite"
-        NaNMode.ARM: ("zero", "max", "min"),         # ARM VCVT
-    }
+# Internal hooks with the reference implementation's signatures.
+def _round(x, fmt: FPFormat, zero_sign: bool = False, sr=None):
+    r, flags, event = _core.fp_round(x, fmt, zero_sign)
+    return r, FPFlags(flags), event
 
-    def to_int(self, bits: int = 32, signed: bool = True,
-               rounding: Rounding | None = None, exact: bool = True):
-        """Convert to a ``bits``-wide INT/UINT. Returns (value, flags).
 
-        Out-of-range, infinite and NaN inputs raise INVALID and return the
-        integer the format's nan_mode selects (RISC-V saturates, x86 returns
-        the "integer indefinite", ARM saturates and maps NaN to 0).
-        ``exact`` raises INEXACT when rounding changed the value."""
-        rounding = rounding or self._format.rounding
-        cls = INT if signed else UINT
-        lo = -(1 << (bits - 1)) if signed else 0
-        hi = (1 << (bits - (1 if signed else 0))) - 1
+def _encode(x, fmt: FPFormat, zero_sign: bool = False, sr=None) -> FP:
+    return _core.fp_encode(x, fmt, zero_sign, sr)
 
-        def invalid(kind):
-            which = self._INT_INVALID[self._format.nan_mode][kind]
-            v = {"max": hi, "min": lo, "zero": 0,
-                 "x86": lo if signed else (1 << bits) - 1}[which]
-            return cls(v, bits), _F.INVALID
 
-        if self.is_nan:
-            return invalid(0)
-        if self.is_inf:
-            return invalid(2 if self._sign else 1)
-        sr = _sr_state["source"](self.sr_bits) if rounding is Rounding.SR else 0
-        q, inexact = _round_to_int(self.exact, rounding, sr, self.sr_bits)
-        if q > hi:
-            return invalid(1)
-        if q < lo:
-            return invalid(2)
-        return cls(q, bits), (_F.INEXACT if inexact and exact else _F(0))
+def _finish(result: FP, flags, event, unrounded, fmt: FPFormat) -> FP:
+    return _core.fp_finish(result, int(flags), event, unrounded, fmt)
 
-    def round_to_integral(self, rounding: Rounding | None = None,
-                          exact: bool = False) -> "FP":
-        """Round to an integral value in the same format (IEEE 754
-        roundToIntegral; ``exact=True`` is roundToIntegralExact)."""
-        fmt = self._format
-        if self.is_nan:
-            return FP._finish(*FP._nan_result(fmt, self), None, None, fmt)
-        if self.is_inf:
-            return FP._make(*self._fields(), fmt)
-        if self.is_zero:     # a DAZ subnormal reads as zero
-            return FP._make(self._sign, 0, 0, fmt)
-        rounding = rounding or fmt.rounding
-        sr = _sr_state["source"](fmt.sr_bits) if rounding is Rounding.SR else 0
-        q, inexact = _round_to_int(self.exact, rounding, sr, fmt.sr_bits)
-        # The integer is representable: it has no more significant bits
-        # than the input (or it is 0 or a power of two).
-        if q == 0 and not fmt.has_zero:
-            return FP._finish(*FP._no_zero(fmt), None, fmt)
-        result = FP._round(Fraction(q), fmt.replace(rounding=Rounding.RNE,
-                                                    wrap=False, ftz=False),
-                           self._sign)[0]
-        result = FP._make(*result._fields(), fmt)
-        flags = _F.INEXACT if inexact and exact else _F(0)
-        return FP._finish(result, flags, None, Fraction(q), fmt)
 
-    # Comparisons with IEEE flags
-    def compare(self, other, signaling: bool = False):
-        """IEEE comparison. Returns (relation, flags) with relation one of
-        'lt', 'eq', 'gt', 'unordered'. Quiet comparisons raise INVALID only
-        for signaling NaNs; signaling ones for any NaN."""
-        c = self._coerce(other)
-        if c is None:
-            raise TypeError(f"cannot compare FP with {type(other).__name__}")
-        a, b, _ = c
-        if a.is_nan or b.is_nan:
-            invalid = signaling or a.is_snan or b.is_snan
-            return "unordered", (_F.INVALID if invalid else _F(0))
-        ka, kb = a._key(), b._key()
-        return ("lt" if ka < kb else "gt" if ka > kb else "eq"), _F(0)
+def _nan_result(fmt: FPFormat, *operands: FP, invalid: bool = False):
+    return _core.fp_nan_result(fmt, list(operands), invalid)
 
-    def eq(self, other, signaling: bool = False):
-        rel, flags = self.compare(other, signaling)
-        return rel == "eq", flags
 
-    def lt(self, other, signaling: bool = True):
-        rel, flags = self.compare(other, signaling)
-        return rel == "lt", flags
+def _sum_zero_sign(sa: bool, sb: bool, fmt: FPFormat) -> bool:
+    """IEEE 754 6.3: an exact zero sum of opposite-signed operands is +0,
+    except -0 when rounding toward negative."""
+    return sa if sa == sb else fmt.rounding is Rounding.RDN
 
-    def le(self, other, signaling: bool = True):
-        rel, flags = self.compare(other, signaling)
-        return rel in ("lt", "eq"), flags
 
-    def __neg__(self):
-        if not self.signed:
-            if self.is_nan:
-                return FP._make(*self._fields(), self._format)
-            if self.is_inf:
-                return FP._finish(*FP._inf_result(True, self._format), -math.inf,
-                                  self._format)
-            return FP._encode(-self.exact, self._format)
-        return FP._make(not self._sign, self._exp.val, self._mantissa.val,
-                        self._format)
+# FP.from_value and FP.convert are native for (value, FPFormat) / (FPFormat);
+# other signatures (format fields, fmt=) go through these resolvers.
+_core._init_slow(_from_value, _convert)
 
-    def __pos__(self):
-        return FP._make(*self._fields(), self._format)
+for _name, _obj in {
+    "zero": classmethod(_zero),
+    "max_value": classmethod(_max_value),
+    "from_raw": classmethod(_from_raw),
+    "all_values": classmethod(_all_values),
+    "ulp": property(_ulp),
+    "error_ulps": _error_ulps,
+    "_key": _key,
+    "_restore": staticmethod(_restore),
+    "_make": staticmethod(lambda sign, field, mant, fmt: _core.fp_make(fmt, sign, field, mant)),
+    "_from_raw_fmt": staticmethod(lambda raw, fmt: _core.fp_from_raw(fmt, raw)),
+    "_round": staticmethod(_round),
+    "_encode": staticmethod(_encode),
+    "_finish": staticmethod(_finish),
+    "_arith": staticmethod(_core.fp_arith),
+    "_nan_result": staticmethod(_nan_result),
+    "_inf_result": staticmethod(_core.fp_inf_result),
+    "_sum_zero_sign": staticmethod(_sum_zero_sign),
+    "_common_of": staticmethod(_common_of),
+}.items():
+    _fn = getattr(_obj, "__func__", None) or getattr(_obj, "fget", None) or _obj
+    if getattr(_fn, "__module__", None) == __name__ and _fn.__name__ != "<lambda>":
+        _fn.__name__, _fn.__qualname__ = _name, f"FP.{_name}"   # as tracebacks and help() show them
+    setattr(FP, _name, _obj)
+del _name, _obj, _fn
+_from_value.__name__, _from_value.__qualname__ = "from_value", "FP.from_value"
+_convert.__name__, _convert.__qualname__ = "convert", "FP.convert"
 
-    def __abs__(self):
-        return FP._make(False, self._exp.val, self._mantissa.val, self._format)
-
-    # Logical
-    def _bitop(self, other, fn, reverse=False):
-        c = self._coerce(other)
-        if c is None:
-            return NotImplemented
-        a, b, fmt = c
-        if reverse:
-            a, b = b, a
-        return FP._from_raw_fmt(fn(a.raw, b.raw), fmt)
-
-    def __and__(self, o):   return self._bitop(o, lambda a, b: a & b)
-    def __rand__(self, o):  return self._bitop(o, lambda a, b: a & b, True)
-    def __or__(self, o):    return self._bitop(o, lambda a, b: a | b)
-    def __ror__(self, o):   return self._bitop(o, lambda a, b: a | b, True)
-    def __xor__(self, o):   return self._bitop(o, lambda a, b: a ^ b)
-    def __rxor__(self, o):  return self._bitop(o, lambda a, b: a ^ b, True)
-    def __invert__(self):
-        return FP._from_raw_fmt(~self.raw & ((1 << self.size) - 1), self._format)
-
-    # Comparison operators (IEEE: NaN is unordered, so only != is true)
-    def _cmp(self, other, fn, if_nan=False):
-        c = self._coerce(other)
-        if c is None:
-            return NotImplemented
-        a, b, _ = c
-        if a.is_nan or b.is_nan:
-            return if_nan
-        return fn(a._key(), b._key())
-
-    def __eq__(self, o): return self._cmp(o, lambda a, b: a == b)
-    def __ne__(self, o): return self._cmp(o, lambda a, b: a != b, True)
-    def __lt__(self, o): return self._cmp(o, lambda a, b: a < b)
-    def __le__(self, o): return self._cmp(o, lambda a, b: a <= b)
-    def __gt__(self, o): return self._cmp(o, lambda a, b: a > b)
-    def __ge__(self, o): return self._cmp(o, lambda a, b: a >= b)
-
-    def __hash__(self):
-        if self.is_nan:
-            return object.__hash__(self)
-        return hash(self._key())
-
-    # Casting
-    def __float__(self):
-        if self.is_nan:
-            return math.copysign(math.nan, -1.0 if self._sign else 1.0)
-        if self.is_inf:
-            return -math.inf if self._sign else math.inf
-        if self.is_zero:
-            return -0.0 if self._sign else 0.0
-        try:
-            return float(self.exact)
-        except OverflowError:
-            return -math.inf if self._sign else math.inf
-
-    def __int__(self):
-        if self.is_nan:
-            raise ValueError("cannot convert NaN to integer")
-        if self.is_inf:
-            raise OverflowError("cannot convert infinity to integer")
-        return int(self.exact)
-
-    def __bool__(self):
-        return not self.is_zero
-
-    def to_bin(self, sep: str = " ") -> str:
-        fields = [self._exp.to_bin(), self._mantissa.to_bin()]
-        if self.signed:
-            fields.insert(0, str(int(self._sign)))
-        return sep.join(f for f in fields if f)
-
-    def to_hex(self) -> str:
-        return format(self.raw, f"0{(self.size + 3) // 4}x")
-
-    def __repr__(self):
-        extra = f", flags={self._flags.name}" if self._flags else ""
-        return f"FP({float(self)!r}, {self._format}{extra})"
-
-    def __str__(self):
-        return str(float(self))
+# Names the 0.1 module also exposed.
+from .sint import INT  # noqa: E402,F401
+from .uint import UINT  # noqa: E402,F401

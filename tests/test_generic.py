@@ -687,3 +687,80 @@ def test_fp_stochastic_ops(rng, iters):
             assert got.raw == want.raw and got.flags == want.flags
     finally:
         set_sr_source(0)
+
+
+@pytest.mark.skipif(__import__("os").environ.get("VERIFLOAT_IMPL", "cpp") == "py",
+                    reason="a 0.1 bug (fixed in the C++ core): see the docstring")
+@pytest.mark.parametrize("M", [1, 2, 3])
+@pytest.mark.parametrize("inf_nan", ["fn", False])
+def test_one_exponent_bit_formats(M, inf_nan):
+    """Formats with a single exponent bit: the subnormals and the only normal
+    binade share one exponent, so in an 'fn' format the subnormal with an
+    all-ones mantissa sits right below the NaN code and must not be taken for
+    it (version 0.1 returned NaN with OVERFLOW for that exactly representable
+    value). Every pair of codes in every rounding mode against the reference
+    model, and the value itself."""
+    for rounding in ROUNDINGS:
+        for tininess in ("after", "before"):
+            f = Fmt.make(1, M, inf_nan=inf_nan, rounding=rounding, tininess=tininess)
+            for a in range(1 << (2 + M)):
+                for b in range(1 << (2 + M)):
+                    check_fp_ops(a, b, f)
+    fmt = FPFormat(1, M, inf_nan=inf_nan)
+    top_subnormal = fmt.from_raw((1 << M) - 1)
+    again = fmt(top_subnormal.exact)
+    assert (again.raw, again.flags) == (top_subnormal.raw, FPFlags(0))
+    for raw in range(1 << (1 + M)):
+        x = fmt.from_raw(raw)
+        if x.is_finite:
+            assert fmt(x.exact).raw == raw and fmt(float(x)).raw == raw and (x * 1).raw == raw, raw
+
+
+def test_integer_square_root(rng, iters):
+    """The core's integer square roots (64-bit, 128-bit, big) against
+    Python's math.isqrt: perfect squares and their neighbours, one below the
+    next square, powers of two, and random integers of every size."""
+    import os
+    if os.environ.get("VERIFLOAT_IMPL", "cpp") != "cpp":
+        pytest.skip("part of the C++ core")
+    from verifloat import _core
+    cases = [0, 1, 2, 3, 4, (1 << 64) - 1, 1 << 64, (1 << 64) + 1, (1 << 128) - 1, 1 << 128, (1 << 128) + 1]
+    for bits in [*range(1, 140), 190, 191, 192, 230, 255, 256, 257, 400, 601, 1000]:
+        r = rng.getrandbits(bits) | (1 << (bits - 1))
+        cases += [r * r, r * r + 1, r * r - 1, (r + 1) * (r + 1) - 1, r * r + r, r * r + 2 * r, 1 << bits,
+                  (1 << bits) - 1, (1 << bits) + 1]
+    for _ in range(iters):
+        cases.append(rng.getrandbits(rng.choice([8, 31, 32, 53, 63, 64, 65, 100, 126, 127, 128, 129, 200, 300])))
+    for n in cases:
+        assert _core._isqrt(n) == math.isqrt(n), n
+    with pytest.raises(ValueError):
+        _core._isqrt(-1)
+
+
+def test_float_of_a_binary_format_is_its_encoding():
+    """float() of a binary64 value is that value's own bits (the sign of a
+    NaN included), and of binary32 / binary16 the exact widening."""
+    import os
+    import struct
+    from verifloat import FP64
+    bits = lambda x: struct.unpack("<Q", struct.pack("<d", x))[0]      # noqa: E731
+    for c in (0, 1, 2, (1 << 52) - 1, 1 << 52, (1 << 52) | 1, (1 << 53) - 1, 0x3FF0000000000000, 0x3FFFFFFFFFFFFFFF,
+              0x4340000000000001, 0x7FEFFFFFFFFFFFFF, 0x7FF0000000000000):
+        for code in (c, c | (1 << 63)):
+            assert bits(float(FP64.from_raw(code))) == code, hex(code)
+    for width, f, pack in ((32, FP32, "<If"), (16, FP16, "<He")):
+        top = (1 << f.exp_bits) - 1
+        for field in (0, 1, 2, top // 2, top - 1, top):
+            for mant in (0, 1, f._mask >> 1, f._mask - 1, f._mask):
+                for sign in (0, 1):
+                    code = (sign << (width - 1)) | (field << f.mantissa_bits) | mant
+                    want = struct.unpack(pack[0] + pack[2], struct.pack(pack[:2], code))[0]
+                    got = float(f.from_raw(code))
+                    if field == top and mant:
+                        assert got != got                                # a NaN
+                    else:
+                        assert bits(got) == bits(want), hex(code)
+    if os.environ.get("VERIFLOAT_IMPL", "cpp") == "cpp":
+        for f in (FP16, FP32, FP64):
+            nan = f.from_raw((f._top << f.mantissa_bits) | (1 << (f.mantissa_bits - 1)))
+            assert bits(float(nan)) >> 63 == 0 and bits(float(-nan)) >> 63 == 1

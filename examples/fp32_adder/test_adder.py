@@ -13,6 +13,7 @@ from cocotb.clock import Clock
 from cocotb.triggers import ReadOnly, RisingEdge
 
 from verifloat import FP32
+from verifloat.scoreboard import Scoreboard
 
 N = int(os.environ.get("N_VECTORS", 2000))
 SEED = int(os.environ.get("SEED", 1))
@@ -68,25 +69,17 @@ async def adder_matches_verifloat(dut):
     dut.rst.value = 0
 
     rng = random.Random(SEED)
-    mismatches = []
-    for i in range(N):
+    # The adder returns a negative quiet NaN (0xFFC00000); any NaN is accepted
+    # for NaN results, everything else must match bit for bit. It has no flag
+    # outputs, so no flags are compared.
+    sb = Scoreboard("adder", nan="any", fail_fast=False, logger=dut._log)
+    for _ in range(N):
         a_bits, b_bits = stimulus(rng), stimulus(rng)
         await send(dut, dut.input_a, dut.input_a_stb, dut.input_a_ack, a_bits)
         await send(dut, dut.input_b, dut.input_b_stb, dut.input_b_ack, b_bits)
-        got_bits = await receive(dut)
+        z = await receive(dut)
 
-        want = FP32.from_raw(a_bits) + FP32.from_raw(b_bits)   # golden model
-        got = FP32.from_raw(got_bits)
-        # The adder returns a negative quiet NaN (0xFFC00000); any NaN is
-        # accepted for NaN results, everything else must match bit for bit.
-        ok = got.is_nan if want.is_nan else got.raw == want.raw
-        if not ok:
-            mismatches.append((a_bits, b_bits, got_bits, want))
-            dut._log.error(
-                f"#{i}: {a_bits:#010x} + {b_bits:#010x}: RTL {got.to_hex()} "
-                f"({float(got)!r}) != model {want.to_hex()} ({float(want)!r})"
-                + (f", model error {float(want.error_ulps()):.3g} ulp,"
-                   f" RTL error {float(got.error_ulps(want.unrounded)):.3g} ulp"
-                   if got.is_finite and want.is_finite else ""))
-    dut._log.info(f"{N} vectors, {len(mismatches)} mismatches (seed {SEED})")
-    assert not mismatches, f"{len(mismatches)} mismatches, first: {mismatches[0][:3]}"
+        a, b = FP32.from_raw(a_bits), FP32.from_raw(b_bits)
+        sb.check(a + b, z, op="a + b", a=a, b=b)            # golden model
+    dut._log.info(sb.summary().splitlines()[0] + f" (seed {SEED})")
+    sb.assert_clean()

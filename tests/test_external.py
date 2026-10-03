@@ -26,6 +26,7 @@ md = pytest.importorskip("ml_dtypes")
 
 from verifloat import (BF16, E2M1, E2M3, E3M2, E4M3, E5M2, FP16, FP32, FP64,  # noqa: E402
                        MXFP4, MXINT8, BlockFormat, BlockTensor, FPFlags, FPFormat)
+from conftest import COMPARED  # noqa: E402
 from reference import caught  # noqa: E402
 
 NX, UF, OF = FPFlags.INEXACT, FPFlags.UNDERFLOW, FPFlags.OVERFLOW
@@ -240,6 +241,83 @@ def test_ml_dtypes_conversion_and_arithmetic(rng, iters, fmt, dtype, utype):
                     assert math.copysign(1, float(got)) == math.copysign(1, float(ref)), ctx
 
 
+@pytest.mark.parametrize("fmt, dtype, utype", [m for m in ML_FORMATS if m[0].size <= 8],
+                         ids=[str(m[0]) for m in ML_FORMATS if m[0].size <= 8])
+def test_ml_dtypes_every_pair(fmt, dtype, utype):
+    """Formats of 8 bits or fewer: every pair of encodings through + - * /
+    (65,536 pairs for an 8-bit format), value and sign of zero."""
+    values = list(fmt.all_values())
+    arr = np.array([float(v) for v in values], dtype=np.float32).astype(dtype)
+    finite_ops = fmt.inf_nan is False
+    bad = []
+    for name, npop, op in OPS:
+        with np.errstate(all="ignore"):
+            ref = npop(arr[:, None], arr[None, :]).astype(np.float32)
+        for i, a in enumerate(values):
+            row = ref[i]
+            for j, b in enumerate(values):
+                if (a.is_nan or b.is_nan) and not fmt.has_nan:
+                    continue
+                if name == "/" and finite_ops and b.is_zero:
+                    continue  # no inf/NaN to return: VeriFloat raises instead
+                got, _ = caught(lambda: op(a, b))
+                r = float(row[j])
+                g = float(got)
+                if not (got.is_nan if math.isnan(r) else g == r and math.copysign(1, g) == math.copysign(1, r)):
+                    bad.append((repr(a), name, repr(b), g, r))
+    COMPARED["ml_dtypes and NumPy (result)"] += 4 * len(values) ** 2
+    assert not bad, (len(bad), bad[:5])
+
+
+def boundary_floats(fmt: FPFormat, step: int = 1) -> list[float]:
+    """Doubles on every rounding boundary of a format: each value, each
+    midpoint of two neighbouring values, half the smallest value, and the
+    first points past the largest (for big formats, every step-th value)."""
+    vals = sorted({abs(float(v)) for v in fmt.all_values() if v.is_finite})
+    out = [0.0]
+    picked = [i for i in range(len(vals) - 1) if i % step == 0 or i < 40 or i > len(vals) - 40]
+    for i in picked:
+        out += [vals[i], (vals[i] + vals[i + 1]) / 2]
+    top = vals[-1]
+    out += [vals[0] / 2, vals[0] / 4, top, top + (top - vals[-2]) / 2, top + (top - vals[-2]), top * 2]
+    return [x for x in dict.fromkeys(out) if math.isfinite(x)]
+
+
+@pytest.mark.parametrize("fmt, dtype, utype", ML_FORMATS, ids=[str(f[0]) for f in ML_FORMATS])
+def test_ml_dtypes_rounding_boundaries(fmt, dtype, utype):
+    """Conversion from float32 on every boundary: each midpoint between
+    neighbouring values and the float32 on either side of it, half the
+    smallest value, and the first points past the largest. As single values
+    and through the array kernels."""
+    pts = []
+    for x in boundary_floats(fmt):
+        with np.errstate(all="ignore"):
+            x32 = np.float32(x)
+        if float(x32) != x:
+            continue                        # not a float32 (bfloat16's overflow points)
+        pts += [x32, np.nextafter(x32, np.float32(np.inf)), np.nextafter(x32, np.float32(-np.inf))]
+    src = np.array(pts + [-p for p in pts], dtype=np.float32)
+    src = src[np.isfinite(src)]
+    with np.errstate(all="ignore"):
+        ref = src.astype(dtype).astype(np.float32)
+    if hasattr(fmt, "array"):
+        got, _ = caught(lambda: fmt.array(src).to_numpy())
+    else:                                   # the pure-Python 0.1 has no arrays: single values only
+        got = [caught(lambda: float(fmt(float(x))))[0] for x in src]
+    step = max(len(src) // 4000, 1)
+    single = {i: caught(lambda: float(fmt(float(src[i]))))[0] for i in range(0, len(src), step)}
+    bad = []
+    for i, (x, g, r) in enumerate(zip(src, got, ref)):
+        ok = math.isnan(g) if math.isnan(r) else g == r and math.copysign(1, g) == math.copysign(1, r)
+        if i in single:
+            s1 = single[i]
+            ok = ok and (math.isnan(s1) if math.isnan(g) else s1 == g and math.copysign(1, s1) == math.copysign(1, g))
+        if not ok:
+            bad.append((float(x), float(g), float(r)))
+    COMPARED["ml_dtypes and NumPy (result)"] += len(src)
+    assert len(src) > 60 and not bad, (len(bad), len(src), bad[:5])
+
+
 # Graphcore gfloat: OCP MX block encoding
 gfloat = pytest.importorskip("gfloat")
 from gfloat import compute_scale_amax, encode_block  # noqa: E402
@@ -302,6 +380,7 @@ def rand_value(rng, fmt: FPFormat) -> float:
 
 
 def same(got, ref: float, ctx):
+    COMPARED["gfloat (result)"] += 1
     if math.isnan(ref):
         assert got.is_nan, ctx
     else:
@@ -320,6 +399,36 @@ def test_gfloat_rounding_modes(rng, iters, fmt, fi, rounding, sat):
         x = rand_value(rng, fmt)
         got, _ = caught(lambda: f(x))
         same(got, round_float(fi, x, GF_MODES[rounding], sat), f"{x!r} {rounding} sat={sat}")
+
+
+@pytest.mark.parametrize("fmt, fi", GF_FORMATS, ids=[str(f[0]) for f in GF_FORMATS])
+@pytest.mark.parametrize("rounding", GF_MODES)
+@pytest.mark.parametrize("sat", [False, True])
+def test_gfloat_rounding_boundaries(fmt, fi, rounding, sat):
+    """Every rounding boundary of the format (each midpoint and the doubles
+    on either side of it, half the smallest value, the overflow points), in
+    the five rounding modes, saturating or not. binary16 and bfloat16 take
+    every 97th value."""
+    if not sat and fmt.inf_nan is False:
+        sat = True   # formats without inf/NaN always saturate
+    f = fmt.replace(rounding=rounding, saturate=sat)
+    # One point is not taken from gfloat 0.5: the double just below half the
+    # smallest value, under ties-away. It is nearer to zero, and gfloat
+    # returns the smallest value. SoftFloat gives zero for binary16
+    # (f64_to_f16, near_maxMag: 0 with INEXACT|UNDERFLOW), as VeriFloat does
+    # in every format.
+    just_below_half = math.nextafter(float(fmt.min_subnormal if fmt.has_zero else 0) / 2, 0)
+    n = 0
+    for x in boundary_floats(fmt, 1 if fmt.size <= 8 else 97):
+        for y in (x, math.nextafter(x, math.inf), math.nextafter(x, -math.inf)):
+            for v in (y, -y):
+                got, _ = caught(lambda: f(v))
+                if rounding is Rounding.RNA and abs(v) == just_below_half and v != 0:
+                    assert got.is_zero and math.copysign(1, float(got)) == math.copysign(1, v), v
+                    continue
+                same(got, round_float(fi, v, GF_MODES[rounding], sat), f"{v!r} {rounding} sat={sat}")
+                n += 1
+    assert n > 60
 
 
 @pytest.mark.parametrize("fmt, fi", GF_FORMATS, ids=[str(f[0]) for f in GF_FORMATS])
