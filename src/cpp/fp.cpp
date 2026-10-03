@@ -98,7 +98,7 @@ nb::object unrounded_of(PyFP* x) {
         case Unr::NEGINF: return nb::borrow(S.ninf);
         case Unr::OBJ:
             if (!is_fraction(u.obj.ptr()))
-                u.obj = steal_checked(PyObject_CallOneArg(S.Fraction, u.obj.ptr()));
+                u.obj = steal_checked(call_one(S.Fraction, u.obj.ptr()));
             return u.obj;
         case Unr::DYB:
             u.obj = fraction_of(*u.big);
@@ -183,7 +183,7 @@ static Num parse_number(PyObject* v, int64_t keep) {
         num_from_double(PyFloat_AS_DOUBLE(v), n);
         n.unr = nb::borrow(v);
     } else {
-        nb::object frac = is_fraction(v) ? nb::borrow(v) : steal_checked(PyObject_CallOneArg(S.Fraction, v));
+        nb::object frac = is_fraction(v) ? nb::borrow(v) : steal_checked(call_one(S.Fraction, v));
         num_from_fraction(frac.ptr(), keep, n);
         n.unr = frac;
     }

@@ -129,7 +129,7 @@ static Rat to_rat(PyObject* v) {
         Dy<BigInt> dy{sig != 0 && double_neg(d), exp, BigInt(sig), false};
         return rat_from_dy(dy);
     }
-    nb::object frac = is_fraction(v) ? nb::borrow(v) : steal_checked(PyObject_CallOneArg(S.Fraction, v));
+    nb::object frac = is_fraction(v) ? nb::borrow(v) : steal_checked(call_one(S.Fraction, v));
     return rat_from_fraction(frac.ptr());
 }
 

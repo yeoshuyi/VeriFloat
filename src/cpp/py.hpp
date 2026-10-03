@@ -53,6 +53,14 @@ inline PyObject* check(PyObject* o) {
 }
 inline nb::object steal_checked(PyObject* o) { return nb::steal(check(o)); }
 
+// f(arg), as PyObject_CallOneArg does it. That function is not in nanobind's
+// list of the CPython symbols a macOS module may leave for the interpreter to
+// supply (darwin-ld-cpython.sym), so the module would not link there.
+inline PyObject* call_one(PyObject* f, PyObject* arg) {
+    PyObject* args[2] = {nullptr, arg};
+    return PyObject_Vectorcall(f, args + 1, 1 | PY_VECTORCALL_ARGUMENTS_OFFSET, nullptr);
+}
+
 // Bodies of CPython slot functions: translate C++ exceptions to Python.
 #define VF_TRY try {
 #define VF_CATCH(ret)                                                        \

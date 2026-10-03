@@ -94,7 +94,7 @@ static Q parse_value(PyObject* v, PyObject* to_fraction) {
         return {big_from_long(i.ptr()), 1};
     }
     // Everything else (and the error cases) through the reference conversion.
-    nb::object f = steal_checked(PyObject_CallOneArg(to_fraction, v));
+    nb::object f = steal_checked(call_one(to_fraction, v));
     return q_from_fraction(f.ptr());
 }
 
