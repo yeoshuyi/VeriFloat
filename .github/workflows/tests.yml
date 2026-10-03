@@ -33,7 +33,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-14, macos-13]
+        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-14, macos-15-intel]
         python: ["3.12", "3.13"]
     runs-on: ${{ matrix.os }}
     steps:
@@ -47,7 +47,8 @@ jobs:
           path: corpus
       - run: pip install . ./archive/python pytest numpy
       # The external references: where a wheel is missing, their tests are skipped.
-      - run: for p in gmpy2 ml-dtypes gfloat apytypes; do pip install --only-binary :all: $p || true; done
+      - run: |
+          for p in gmpy2 ml-dtypes gfloat apytypes; do pip install --only-binary :all: $p || true; done
       - run: python tools/golden_corpus verify corpus
       - name: test suite (the installed build, not the source directory)
         run: |
@@ -57,6 +58,9 @@ jobs:
   windows:
     needs: corpus
     runs-on: windows-latest
+    env:
+      # MSYS2's Python may be marked externally managed; this job owns it.
+      PIP_BREAK_SYSTEM_PACKAGES: "1"
     defaults:
       run:
         shell: msys2 {0}
