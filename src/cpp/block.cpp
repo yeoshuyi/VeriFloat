@@ -116,7 +116,7 @@ static bool value_fv(PyObject* v, FV<u128>& out) {
             out = FV<u128>();
             return true;
         }
-        const int tz = __builtin_ctzll(d.sig);
+        const int tz = (int)std::countr_zero((uint64_t)d.sig);
         out = {(u128)(d.sig >> tz), d.exp + tz, d.neg};
         return true;
     }

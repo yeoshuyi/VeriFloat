@@ -59,7 +59,7 @@ nb::object fraction_nd(nb::object n, nb::object d) {
 
 static int64_t ctz(u128 x) {
     uint64_t lo = (uint64_t)x;
-    return lo ? __builtin_ctzll(lo) : 64 + __builtin_ctzll((uint64_t)(x >> 64));
+    return lo ? (int)std::countr_zero((uint64_t)lo) : 64 + (int)std::countr_zero((uint64_t)(x >> 64));
 }
 static int64_t ctz(const BigInt& x) { return (int64_t)boost::multiprecision::lsb(x); }
 

@@ -133,7 +133,7 @@ VF_INLINE void lean_add(LeanState& st, uint64_t T, int64_t te, bool tn, const RT
         st.an = F.rounding == RDN;
         return;
     }
-    const int64_t lz = __builtin_clzll(S);
+    const int64_t lz = (int)std::countl_zero((uint64_t)S);
     const uint64_t N = S << lz;   // leading bit at 63
     const int64_t kF = 63 - MF;
     uint64_t s = N >> kF;

@@ -1,7 +1,8 @@
 # The test suite on the operating systems and CPUs that cannot be reached
-# from one Linux machine: macOS (Apple silicon and Intel), Windows (MSYS2
-# UCRT64: the core needs a compiler with __int128, which MSVC lacks) and
-# native ARM Linux. Linux distributions, C libraries, compilers and emulated
+# from one Linux machine: macOS (Apple silicon and Intel), Windows (MSVC with
+# the python.org Python, and MinGW-w64 in MSYS2) and native ARM Linux. MSVC
+# has no __int128, so it builds the portable 128-bit integers of
+# src/cpp/int128.hpp; the `portable` job runs them on Linux as well. Linux distributions, C libraries, compilers and emulated
 # architectures are covered locally by tools/in_container.
 #
 # The first job writes the golden corpus on x86-64 Linux; every other job
@@ -55,7 +56,55 @@ jobs:
           rm -rf src/verifloat
           pytest -q -p no:cacheprovider tests -k "not test_edge"
 
-  windows:
+  # GCC with the portable 128-bit integers that MSVC uses, on the whole suite.
+  portable:
+    needs: corpus
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@v4
+        with:
+          name: corpus
+          path: corpus
+      - run: pip install -C cmake.define.VF_PORTABLE_INT128=ON . ./archive/python pytest numpy gmpy2 ml-dtypes gfloat apytypes
+      - run: python tools/golden_corpus verify corpus
+      - name: test suite (the installed build, not the source directory)
+        run: |
+          rm -rf src/verifloat
+          pytest -q -p no:cacheprovider tests -k "not test_edge"
+
+  msvc:
+    needs: corpus
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.12", "3.13"]
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: corpus
+          path: corpus
+      - run: pip install . ./archive/python pytest numpy
+      - name: external references (where a wheel is missing, their tests are skipped)
+        shell: bash
+        run: |
+          for p in gmpy2 ml-dtypes gfloat apytypes; do pip install --only-binary :all: $p || true; done
+      - run: python tools/golden_corpus verify corpus
+      - name: test suite (the installed build, not the source directory)
+        shell: bash
+        run: |
+          rm -rf src/verifloat
+          pytest -q -p no:cacheprovider tests -k "not test_edge"
+
+  mingw:
     needs: corpus
     runs-on: windows-latest
     env:

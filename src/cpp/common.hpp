@@ -4,7 +4,7 @@
 // Arithmetic produces a "sticky dyadic": a significand with enough bits for
 // correct rounding plus a sticky flag for anything nonzero below it. The
 // rounding kernel and the operations are templated on the significand type:
-// unsigned __int128 for the common case, cpp_int when a format is too wide.
+// a 128-bit integer for the common case, cpp_int when a format is too wide.
 #pragma once
 
 #include <boost/multiprecision/cpp_int.hpp>
@@ -13,6 +13,7 @@
 // not left to what another header happens to pull in (that differs between
 // standard libraries and their versions).
 #include <algorithm>
+#include <bit>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -30,6 +31,8 @@
 #undef OVERFLOW
 #undef UNDERFLOW
 
+#include "int128.hpp"
+
 namespace vf {
 
 // The core (this header, kernel.hpp, ops.hpp, the fast kernels) is plain
@@ -40,18 +43,27 @@ namespace vf {
 enum class Err : uint8_t { VALUE, ZERO_DIVISION, OVERFLOW, TYPE, RUNTIME };
 [[noreturn]] void fail(Err kind, const std::string& msg);
 
+// The compiler's 128-bit integers where it has them (GCC, Clang), the
+// portable ones of int128.hpp elsewhere (MSVC) or when VF_PORTABLE_INT128 asks
+// for them, to test them. Code that converts between u128, i128 and narrower
+// integers casts explicitly, so that it compiles with either.
+#if defined(__SIZEOF_INT128__) && !defined(VF_PORTABLE_INT128)
 using u128 = unsigned __int128;
 using i128 = __int128;
+#else
+using u128 = U128;
+using i128 = I128;
+#endif
 using BigInt = boost::multiprecision::cpp_int;
 
 // Widest intermediate the u128 tier may hold.
 constexpr int64_t kU128Bits = 126;
 
 // Bit length (0 for 0).
-inline int64_t bitlen(uint64_t x) { return x ? 64 - __builtin_clzll(x) : 0; }
+inline int64_t bitlen(uint64_t x) { return 64 - std::countl_zero(x); }
 inline int64_t bitlen(u128 x) {
     uint64_t hi = (uint64_t)(x >> 64);
-    return hi ? 128 - __builtin_clzll(hi) : bitlen((uint64_t)x);
+    return hi ? 128 - std::countl_zero(hi) : bitlen((uint64_t)x);
 }
 inline int64_t bitlen(const BigInt& x) {
     return x == 0 ? 0 : (int64_t)boost::multiprecision::msb(x) + 1;

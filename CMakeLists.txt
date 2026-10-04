@@ -7,6 +7,18 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # which with Clang needs clang-scan-deps to be installed.
 set(CMAKE_CXX_SCAN_FOR_MODULES OFF)
 
+# MSVC has no __int128: the core then uses the portable 128-bit integers of
+# src/cpp/int128.hpp. This option makes GCC and Clang use them too, to test
+# them where the suite can run.
+option(VF_PORTABLE_INT128 "Use the portable 128-bit integers even where the compiler has __int128" OFF)
+if(VF_PORTABLE_INT128)
+  add_compile_definitions(VF_PORTABLE_INT128)
+endif()
+if(MSVC)
+  # /bigobj: the Boost-heavy files exceed the default section limit.
+  add_compile_options(/bigobj /utf-8 /Zc:__cplusplus)
+endif()
+
 find_package(Python 3.12 COMPONENTS Interpreter Development.Module REQUIRED)
 execute_process(
   COMMAND "${Python_EXECUTABLE}" -m nanobind --cmake_dir

@@ -897,7 +897,7 @@ bool number_fv(PyObject* o, FV<u128>& v) {
         v = FV<u128>();
         return true;
     }
-    const int tz = __builtin_ctzll(mag);
+    const int tz = (int)std::countr_zero((uint64_t)mag);
     mag >>= tz;
     if (mag >> 62) return false;
     v = {mag, exp + tz, neg};

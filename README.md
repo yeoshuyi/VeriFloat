@@ -639,8 +639,8 @@ python tools/golden_corpus generate corpus && CORPUS=$PWD/corpus tools/in_contai
 Running elsewhere found three build problems, all fixed: the Boost.Multiprecision download failed with CMake 3.30 and later when the system had no Boost; a standard header was included only by accident of one GCC version; and with Clang, CMake wanted `clang-scan-deps` to look for C++ modules the project doesn't have. It also found the dependence on the processor's floating-point state described above, now removed, and that on a big-endian machine numeric buffers other than NumPy arrays (`array.array`, a `memoryview`) were refused with an error instead of read. No platform gave a different result bit or flag.
 
 **Not run:**
-- **macOS**, and **Windows with the Python extension**: neither can be run from a Linux machine. `.github/workflows/tests.yml` is written for them (macOS on Apple silicon and Intel, Windows with MSYS2 UCRT64, native ARM Linux; each job must reproduce the corpus and pass the suite) but has not been run yet.
-- **MSVC** cannot build the core, which uses `__int128` (GCC, Clang and MinGW-w64 have it). For the same reason **32-bit targets** are not supported.
+- **macOS**, and **Windows with the Python extension**: neither can be run from a Linux machine. `.github/workflows/tests.yml` is written for them (macOS on Apple silicon and Intel, Windows with MSVC and with MSYS2 UCRT64, native ARM Linux; each job must reproduce the corpus and pass the suite) and has yet to run green.
+- **MSVC** has no `__int128`, so an MSVC build uses the portable 128-bit integers of `src/cpp/int128.hpp`, written in plain 64-bit C++. They were checked here rather than under MSVC: `tests/native/int128_check.cpp` compares every operator with GCC's `__int128` (94 million checks; it catches each of 10 planted bugs), and a GCC build with `-DVF_PORTABLE_INT128=ON` passes the whole suite and reproduces the corpus. The MSVC build itself has not been compiled yet. It has no SIMD kernels: the CPU detection they rely on is GCC/Clang only, so MSVC uses the scalar code (same results, slower on wide arrays). **32-bit targets** are untested.
 - **Real hardware** other than x86-64: the other architectures were emulated.
 
 ## Performance
@@ -714,7 +714,7 @@ See [Validation](#validation) for how each path is checked against the others an
 - **`FPArray`** holds formats of at most 64 bits, is immutable (indexing copies, there is no item assignment) and cannot be empty. Fancy indexing (index arrays, boolean masks) is not supported. Only `+ − × ÷`, conversion, construction and `matmul`/`dot` have fast kernels; the other element-wise methods and `sum` run the scalar operation per element. Mixing array formats works when the promoted format still fits 64 bits.
 - **The C library** runs the general code only (no fast kernels), has no arrays, accumulators or block tensors, and its `uint64_t` entry points take formats of at most 64 bits (wider ones use the `128` and `_w` functions). The SystemVerilog package was tried with Verilator only.
 - **SIMD kernels are x86-64 only** (AVX2 or AVX-512, GCC or Clang). Other platforms use the scalar kernels, with the same results (see [Platforms](#platforms)).
-- **Compilers and targets:** GCC 11 or later, or Clang, on a 64-bit target (the core uses `__int128`); MSVC is not supported. See [Platforms](#platforms) for what has been run.
+- **Compilers and targets:** GCC 11 or later, Clang, or MSVC (Visual Studio 2022), on a 64-bit target. Where the compiler has `__int128` the core uses it; elsewhere it uses `src/cpp/int128.hpp` (`-DVF_PORTABLE_INT128=ON` forces that, to test it). See [Platforms](#platforms) for what has been run.
 - **Accumulator models** cover common structures (sequential, pairwise, aligned groups), but real accumulators vary. Check your RTL's documentation.
 - **The default `FPFormat()`** is an IEEE-style E2M1, rarely what you want. Pass a format.
 

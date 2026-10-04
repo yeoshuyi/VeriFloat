@@ -15,6 +15,9 @@
 #if defined(__GNUC__) || defined(__clang__)
 #define VF_INLINE inline __attribute__((always_inline))
 #define VF_NOINLINE __attribute__((noinline))
+#elif defined(_MSC_VER)
+#define VF_INLINE __forceinline
+#define VF_NOINLINE __declspec(noinline)
 #else
 #define VF_INLINE inline
 #define VF_NOINLINE
@@ -37,10 +40,10 @@ template <class U> struct FV {
 
 template <class U> constexpr int kBitsOf = (int)sizeof(U) * 8;
 
-inline int64_t fbitlen(uint64_t x) { return 64 - __builtin_clzll(x); }   // x != 0
+inline int64_t fbitlen(uint64_t x) { return 64 - (int)std::countl_zero((uint64_t)x); }   // x != 0
 inline int64_t fbitlen(u128 x) {
     uint64_t hi = (uint64_t)(x >> 64);
-    return hi ? 128 - __builtin_clzll(hi) : 64 - __builtin_clzll((uint64_t)x);
+    return hi ? 128 - (int)std::countl_zero((uint64_t)hi) : 64 - (int)std::countl_zero((uint64_t)x);
 }
 
 // Can fast_round target this format?
