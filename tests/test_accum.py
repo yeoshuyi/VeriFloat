@@ -13,6 +13,7 @@ import ctypes
 import ctypes.util
 import math
 import struct
+import sys
 from fractions import Fraction
 
 import pytest
@@ -22,7 +23,13 @@ from verifloat import (FP16, FP32, FP64, NVFP4, Accumulator, BlockTensor, FPFlag
 from test_external import rand_bits
 
 np = pytest.importorskip("numpy")
-libm = ctypes.CDLL(ctypes.util.find_library("m"))
+
+# The C library's fma and fmaf are the reference for the FMA-chain model. They
+# live in libm on POSIX systems and in the Universal C Runtime on Windows.
+_libm_name = ctypes.util.find_library("m") or ("ucrtbase" if sys.platform == "win32" else None)
+if _libm_name is None:
+    pytest.skip("no C math library to take fma from", allow_module_level=True)
+libm = ctypes.CDLL(_libm_name)
 libm.fmaf.restype = ctypes.c_float
 libm.fmaf.argtypes = [ctypes.c_float] * 3
 libm.fma.restype = ctypes.c_double

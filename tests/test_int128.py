@@ -13,6 +13,7 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -23,7 +24,7 @@ CXX = next((c for c in (os.environ.get("CXX"), "c++", "g++", "clang++") if c and
 
 @pytest.mark.skipif(CXX is None, reason="no C++ compiler")
 def test_portable_int128_matches_the_builtin_one(tmp_path, iters):
-    exe = tmp_path / "int128_check"
+    exe = tmp_path / ("int128_check.exe" if sys.platform == "win32" else "int128_check")
     build = subprocess.run([CXX, "-std=c++20", "-O2", f"-I{ROOT / 'src' / 'cpp'}",
                             str(ROOT / "tests" / "native" / "int128_check.cpp"), "-o", str(exe)],
                            capture_output=True, text=True)

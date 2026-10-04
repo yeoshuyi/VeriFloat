@@ -705,7 +705,7 @@ def _open_out(dest):
     if dest is None or dest == "-":
         yield sys.stdout
     elif isinstance(dest, (str, os.PathLike)):
-        with open(dest, "w", newline="\n") as fh:
+        with open(dest, "w", encoding="utf-8", newline="\n") as fh:
             yield fh
     else:
         yield dest
@@ -716,7 +716,7 @@ def _open_lines(source):
     if source == "-":
         yield sys.stdin
     elif isinstance(source, (str, os.PathLike)):
-        with open(source, newline=None) as fh:
+        with open(source, encoding="utf-8", newline=None) as fh:
             yield fh
     else:
         yield source
@@ -1139,11 +1139,11 @@ def _cmd_generate(a: argparse.Namespace) -> int:
     fmt_name = a.format or (detect_format(a.output) if a.output != "-" else "testfloat")
     write(a.output, stream, format=fmt_name, header=a.header)
     if a.meta:
-        with open(a.meta, "w") as fh:
+        with open(a.meta, "w", encoding="utf-8", newline="\n") as fh:
             json.dump(_meta(spec, stream, None), fh, indent=2)
             fh.write("\n")
     if a.sv:
-        with open(a.sv, "w") as fh:
+        with open(a.sv, "w", encoding="utf-8", newline="\n") as fh:
             fh.write(systemverilog(spec))
     print(f"{spec}: wrote {stream.stats}" + ("" if a.output == "-" else f" to {a.output}"),
           file=sys.stderr)
