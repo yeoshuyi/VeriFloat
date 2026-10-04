@@ -99,6 +99,10 @@ def _fetch(repo: str, sha: str, tree: str, dest: Path) -> None:
 # 64-bit little-endian GCC or Clang host; on a big-endian host the one line
 # that says otherwise is removed (see _build).
 PLATFORM = "Linux-x86_64-GCC"
+# On Windows (MinGW-w64 GCC, as in MSYS2) the same build directory serves:
+# the projects' own Win64-MinGW-w64 one differs only in naming its compiler
+# by a cross-compiling prefix, and in the .exe suffix, given here instead.
+EXE = ".exe" if sys.platform == "win32" else ""
 
 
 def _build(spec: str) -> Path:
@@ -110,7 +114,7 @@ def _build(spec: str) -> Path:
     _fetch(*SOFTFLOAT, src / "berkeley-softfloat-3")
     _fetch(*TESTFLOAT, src / "berkeley-testfloat-3")
     build = root / spec
-    gen = build / "berkeley-testfloat-3" / "build" / PLATFORM / "testfloat_gen"
+    gen = build / "berkeley-testfloat-3" / "build" / PLATFORM / f"testfloat_gen{EXE}"
     if gen.exists():
         return build
     for name in ("berkeley-softfloat-3", "berkeley-testfloat-3"):
@@ -120,17 +124,17 @@ def _build(spec: str) -> Path:
             header = build / name / "build" / PLATFORM / "platform.h"
             header.write_text(header.read_text().replace("#define LITTLEENDIAN 1", ""))
     run = lambda d, *args: subprocess.run(
-        ["make", "-s", "-j8", f"SPECIALIZE_TYPE={spec}", *args],
+        ["make", "-s", "-j8", f"SPECIALIZE_TYPE={spec}", f"EXE={EXE}", *args],
         cwd=build / d / "build" / PLATFORM, check=True,
         stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
     run("berkeley-softfloat-3")
-    run("berkeley-testfloat-3", "testfloat_gen")
+    run("berkeley-testfloat-3", f"testfloat_gen{EXE}")
     return build
 
 
 def testfloat_gen(spec: str) -> Path:
     """Path to a testfloat_gen built against SoftFloat with ``spec``."""
-    return _build(spec) / "berkeley-testfloat-3" / "build" / PLATFORM / "testfloat_gen"
+    return _build(spec) / "berkeley-testfloat-3" / "build" / PLATFORM / f"testfloat_gen{EXE}"
 
 
 def softfloat_ref(spec: str) -> Path:
@@ -139,7 +143,7 @@ def softfloat_ref(spec: str) -> Path:
     build = _build(spec)
     source = Path(__file__).parent / "native" / "softfloat_ref.c"
     digest = hashlib.sha256(source.read_bytes()).hexdigest()[:12]
-    exe = build / f"softfloat_ref-{digest}"
+    exe = build / f"softfloat_ref-{digest}{EXE}"
     if not exe.exists():
         soft = build / "berkeley-softfloat-3"
         subprocess.run(["gcc", "-O2", "-DSOFTFLOAT_FAST_INT64", "-o", str(exe), str(source),

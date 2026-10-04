@@ -125,8 +125,11 @@ jobs:
         with:
           msystem: UCRT64
           update: true
+          # make (with the toolchain's gcc and ar) builds Berkeley SoftFloat and
+          # TestFloat, the references of the SoftFloat and TestFloat tests.
           install: >-
             git
+            make
             mingw-w64-ucrt-x86_64-gcc
             mingw-w64-ucrt-x86_64-cmake
             mingw-w64-ucrt-x86_64-ninja
