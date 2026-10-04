@@ -22,7 +22,6 @@ import os
 import platform
 import shutil
 import struct
-import sys
 import warnings
 from fractions import Fraction
 from pathlib import Path
@@ -41,10 +40,13 @@ from verifloat import (E4M3, FP16, FP32, FP64, NVFP4, Accumulator, BlockTensor, 
 from testfloat_build import shared_library  # noqa: E402
 
 SRC = Path(__file__).parent / "native" / "fpstate.c"
-# The state a process starts in: all exceptions masked, round to nearest; the
-# x87 at 64-bit precision, except on 64-bit Windows, which starts it at 53.
+# The state a process starts in: all exceptions masked, round to nearest. The
+# x87 runs at 64-bit precision (Linux, macOS, and Windows with MinGW-w64's C
+# runtime) or at 53-bit (Windows with Microsoft's, as the python.org builds):
+# which one depends on how the interpreter was built, so the tests take the one
+# they find and put it back.
 DEFAULT_MXCSR = 0x1F80
-DEFAULT_CW = 0x027F if sys.platform == "win32" else 0x037F
+DEFAULT_CWS = (0x037F, 0x027F)
 DAZ, FTZ = 1 << 6, 1 << 15
 STATES = {
     "flush-to-zero and denormals-are-zero (-ffast-math)": dict(mxcsr=DEFAULT_MXCSR | DAZ | FTZ),
@@ -164,13 +166,21 @@ def buffers():
 
 
 @pytest.fixture(scope="module")
-def clean(fp, clib, buffers):
-    assert (fp.get_mxcsr() & 0xFFC0, fp.get_x87_cw()) == (DEFAULT_MXCSR, DEFAULT_CW), "the test must start in the default state"
+def start_cw(fp):
+    """The x87 control word the process started with (one of DEFAULT_CWS)."""
+    cw = fp.get_x87_cw()
+    assert fp.get_mxcsr() & 0xFFC0 == DEFAULT_MXCSR and cw in DEFAULT_CWS, \
+        f"the test must start in a default state, not MXCSR {fp.get_mxcsr():#06x}, x87 {cw:#06x}"
+    return cw
+
+
+@pytest.fixture(scope="module")
+def clean(fp, clib, buffers, start_cw):
     return results(clib, buffers)
 
 
 @pytest.mark.parametrize("state", STATES)
-def test_results_do_not_depend_on_the_floating_point_state(fp, clib, buffers, clean, state):
+def test_results_do_not_depend_on_the_floating_point_state(fp, clib, buffers, clean, start_cw, state):
     change = STATES[state]
     try:
         if "mxcsr" in change:
@@ -182,7 +192,7 @@ def test_results_do_not_depend_on_the_floating_point_state(fp, clib, buffers, cl
         got = results(clib, buffers)
     finally:
         fp.clean_mmx()
-        fp.set_x87_cw(DEFAULT_CW)
+        fp.set_x87_cw(start_cw)
         fp.set_mxcsr(DEFAULT_MXCSR)
     different = [k for k in clean if got[k] != clean[k]]
     assert not different, (state, different[:6], [(clean[k], got[k]) for k in different[:1]])
