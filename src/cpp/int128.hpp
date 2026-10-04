@@ -24,8 +24,9 @@ public:
     constexpr Int128() = default;
     // From any integer type: sign-extended if that type is signed.
     template <class T, std::enable_if_t<std::is_integral_v<T>, int> = 0>
-    constexpr Int128(T v)
-        : lo((uint64_t)v), hi(std::is_signed_v<T> && v < 0 ? ~uint64_t(0) : 0) {}
+    constexpr Int128(T v) : lo((uint64_t)v), hi(0) {
+        if constexpr (std::is_signed_v<T>) hi = v < 0 ? ~uint64_t(0) : 0;
+    }
     // Between the signed and the unsigned type: the same 128 bits.
     constexpr explicit Int128(const Int128<!Signed>& o) : lo(o.lo), hi(o.hi) {}
     static constexpr Int128 make(uint64_t h, uint64_t l) {

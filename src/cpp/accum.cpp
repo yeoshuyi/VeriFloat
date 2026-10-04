@@ -302,7 +302,7 @@ bool spec_from(nb::handle acc, AccSpec& s) {
     // acc = (fmt, order, product, group, align_bits)
     nb::tuple t = nb::borrow<nb::tuple>(acc);
     s.fmt = t[0].ptr();
-    std::string order = nb::cast<std::string>(nb::str(t[1]));
+    std::string order = nb::cast<std::string>(nb::str(nb::handle(t[1])));
     s.order = order == "exact" ? 0 : order == "sequential" ? 1 : 2;
     s.product = t[2].is_none() ? nullptr : t[2].ptr();
     s.group = nb::cast<int64_t>(t[3]);
