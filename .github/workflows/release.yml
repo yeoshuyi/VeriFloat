@@ -1,0 +1,157 @@
+# Release: build the source package and the wheels, test every wheel on its
+# own platform, and publish.
+#
+#   Actions tab -> release -> Run workflow, target "none"      build and test only
+#   Actions tab -> release -> Run workflow, target "testpypi"  ... and upload to TestPyPI
+#   git tag v0.2.0 && git push origin v0.2.0                   ... and upload to PyPI
+#
+# Uploads use PyPI trusted publishing (no stored token): each index needs a
+# publisher for this repository, workflow file release.yml, and environment
+# "pypi" or "testpypi" (see CONTRIBUTING.md). A tag must match the version
+# in src/verifloat/__init__.py.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      target:
+        description: "Where to upload the build"
+        type: choice
+        options: [none, testpypi]
+        default: none
+
+# Read-only, except for the publishing jobs below. Actions are pinned to a
+# commit (the release in the comment).
+permissions:
+  contents: read
+
+jobs:
+  # The golden corpus, written once; every wheel must reproduce it bit for bit.
+  corpus:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
+        with:
+          python-version: "3.12"
+      - run: pip install .
+      - run: python tools/golden_corpus generate corpus
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: corpus
+          path: corpus
+
+  sdist:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
+        with:
+          python-version: "3.12"
+      - run: pip install build twine
+      - run: python -m build --sdist
+      - run: twine check --strict dist/*
+      - name: the source package builds and imports
+        run: |
+          python -m venv /tmp/v
+          /tmp/v/bin/pip install dist/*.tar.gz
+          cd /tmp && /tmp/v/bin/python -c "import verifloat; print(verifloat.__version__, verifloat.FP16(1) / verifloat.FP16(3))"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: dist-sdist
+          path: dist/*.tar.gz
+
+  wheels:
+    needs: corpus
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {os: ubuntu-24.04, name: linux-x86_64}         # manylinux and musllinux
+          - {os: ubuntu-24.04-arm, name: linux-aarch64}
+          - {os: macos-14, name: macos-arm64}
+          - {os: macos-15-intel, name: macos-x86_64}
+          - {os: windows-latest, name: windows-amd64}
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        with:
+          name: corpus
+          path: corpus
+      - uses: pypa/cibuildwheel@8d2b08b68458a16aeb24b64e68a09ab1c8e82084  # v3.4.1
+        with:
+          output-dir: wheelhouse
+      - name: no MSVC runtime DLL is needed (it is linked in)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          pip install pefile
+          python - <<'EOF'
+          import glob, zipfile, pefile
+          bad = []
+          for whl in glob.glob("wheelhouse/*.whl"):
+              with zipfile.ZipFile(whl) as z:
+                  for name in z.namelist():
+                      if name.endswith((".pyd", ".dll")):
+                          pe = pefile.PE(data=z.read(name))
+                          dlls = [e.dll.decode().lower() for e in pe.DIRECTORY_ENTRY_IMPORT]
+                          bad += [(whl, name, d) for d in dlls if d.startswith(("msvcp", "vcruntime", "concrt"))]
+          for b in bad:
+              print("needs", b[2], ":", b[0], b[1])
+          raise SystemExit(1 if bad else 0)
+          EOF
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: dist-wheels-${{ matrix.name }}
+          path: wheelhouse/*.whl
+
+  # The tag names the version that is uploaded.
+  check-version:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+      - name: tag and package version agree
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          version=$(sed -n 's/^__version__ = "\(.*\)"$/\1/p' src/verifloat/__init__.py)
+          echo "package $version, tag $GITHUB_REF_NAME"
+          [ "v$version" = "$GITHUB_REF_NAME" ]
+
+  publish-testpypi:
+    needs: [sdist, wheels, check-version]
+    if: github.event_name == 'workflow_dispatch' && inputs.target == 'testpypi'
+    runs-on: ubuntu-24.04
+    environment:
+      name: testpypi
+      url: https://test.pypi.org/project/verifloat/
+    permissions:
+      id-token: write          # trusted publishing
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
+      - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33  # v1.14.2
+        with:
+          repository-url: https://test.pypi.org/legacy/
+
+  publish-pypi:
+    needs: [sdist, wheels, check-version]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    environment:
+      name: pypi
+      url: https://pypi.org/project/verifloat/
+    permissions:
+      id-token: write          # trusted publishing
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
+      - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33  # v1.14.2

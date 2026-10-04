@@ -36,6 +36,10 @@ struct CoreError : std::exception {
 
 thread_local std::string t_error;
 
+// The stochastic-rounding bits: one setting for the process, read and
+// written under a lock so that threads see a consistent value, source and
+// context. The source is called outside the lock (it may call vf_set_sr).
+std::mutex g_sr_lock;
 uint64_t g_sr_value = 0;
 uint64_t (*g_sr_source)(int, void*) = nullptr;
 void* g_sr_ctx = nullptr;
@@ -45,7 +49,16 @@ void* g_sr_ctx = nullptr;
 void fail(Err, const std::string& msg) { throw CoreError(msg); }
 
 void sr_draw(SRArg& sr, const Fmt& f) {
-    const uint64_t v = g_sr_source ? g_sr_source((int)f.sr_bits, g_sr_ctx) : g_sr_value;
+    uint64_t (*source)(int, void*);
+    void* ctx;
+    uint64_t v;
+    {
+        std::lock_guard<std::mutex> hold(g_sr_lock);
+        source = g_sr_source;
+        ctx = g_sr_ctx;
+        v = g_sr_value;
+    }
+    if (source) v = source((int)f.sr_bits, ctx);
     if (v <= (uint64_t)INT64_MAX) sr.set((int64_t)v);
     else sr.set(BigInt(v));
 }
@@ -191,6 +204,10 @@ uint64_t from_big(const vf_fmt* f, const BigInt& v, int* flags) {
 // ---------------------------------------------------------------- formats
 
 std::mutex g_lock;
+// Every spelling of a name that was asked for is remembered, up to this many;
+// beyond it, names are still parsed and the canonical ones still kept, but
+// a caller cycling through endless spellings cannot grow the table forever.
+constexpr size_t kMaxAliases = 4096;
 std::map<std::string, const vf_fmt*>& registry() {
     static std::map<std::string, const vf_fmt*> r;
     return r;
@@ -220,7 +237,7 @@ const vf_fmt* vf_format(const char* name) {
             reg.emplace(canonical, made);
             h = made;
         }
-        reg.emplace(key, h);
+        if (reg.size() < kMaxAliases) reg.emplace(key, h);
         return h;
     });
 }
@@ -346,10 +363,12 @@ double vf_to_double(const vf_fmt* f, uint64_t a) {
 }
 
 void vf_set_sr(uint64_t bits) {
+    std::lock_guard<std::mutex> hold(g_sr_lock);
     g_sr_source = nullptr;
     g_sr_value = bits;
 }
 void vf_set_sr_source(uint64_t (*source)(int bits, void* ctx), void* ctx) {
+    std::lock_guard<std::mutex> hold(g_sr_lock);
     g_sr_source = source;
     g_sr_ctx = ctx;
 }

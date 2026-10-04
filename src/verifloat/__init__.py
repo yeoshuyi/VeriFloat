@@ -23,4 +23,4 @@ __all__ = [
     "IntCastWarning", "BlockFormatWarning", "FPOverflowWarning",
     "FPUnderflowWarning",
 ]
-__version__ = "0.1.0"
+__version__ = "0.2.0"

@@ -286,9 +286,10 @@ nb::object sum_products(const In* a, const In* b, size_t n, size_t sa, size_t sb
 // numbers, and non-finite FP values next to numbers (the reference raises
 // part way through).
 bool parse_all(nb::handle seq, std::vector<In>& out, bool& nonfinite_fp, bool& numbers) {
-    nb::object list = steal_checked(PySequence_Fast(seq.ptr(), "expected a sequence"));
-    Py_ssize_t n = PySequence_Fast_GET_SIZE(list.ptr());
-    PyObject** items = PySequence_Fast_ITEMS(list.ptr());
+    // A tuple of strong references: parsing an item can run Python code.
+    nb::object list = snapshot(seq.ptr(), "expected a sequence");
+    Py_ssize_t n = tuple_size(list);
+    PyObject** items = n ? &PyTuple_GET_ITEM(list.ptr(), 0) : nullptr;
     out.resize((size_t)n);
     for (Py_ssize_t i = 0; i < n; ++i) {
         if (!parse_in(items[i], out[(size_t)i])) return false;
@@ -967,6 +968,12 @@ static nb::object py_matmul(nb::handle fa, nb::handle fb, int64_t nbatch, int64_
     bool exact = acc.is_none();
     if (!exact && !spec_from(acc, spec)) return nb::none();
     MatDims d{nbatch, m, k, n, batch_a, batch_b};
+    // The operand sizes the dimensions imply; every path below checks the
+    // operands against them before indexing.
+    if (nbatch < 1 || m < 1 || k < 1 || n < 1) raise(PyExc_ValueError, "matmul dimensions must be positive");
+    const size_t need_a = elems_mul(elems_mul((size_t)(batch_a ? nbatch : 1), (size_t)m), (size_t)k);
+    const size_t need_b = elems_mul(elems_mul((size_t)(batch_b ? nbatch : 1), (size_t)k), (size_t)n);
+    elems_mul(elems_mul((size_t)nbatch, (size_t)m), (size_t)n);
     std::vector<uint64_t> raw;
     std::vector<uint8_t> flags, ok;
     std::vector<DB> unr;
@@ -975,8 +982,7 @@ static nb::object py_matmul(nb::handle fa, nb::handle fb, int64_t nbatch, int64_
         std::vector<FV<u128>> qa, qb;
         int64_t ba, bb;
         fast = parse_fast(fa, qa, ba) && parse_fast(fb, qb, bb) &&
-               qa.size() == (size_t)((batch_a ? nbatch : 1) * m * k) &&
-               qb.size() == (size_t)((batch_b ? nbatch : 1) * k * n) &&
+               qa.size() == need_a && qb.size() == need_b &&
                fast_matmul(qa, ba, qb, bb, d, spec, raw, flags, ok, &unr);
     }
     // Exact results (Fractions): the same sums, not rounded.
@@ -987,8 +993,7 @@ static nb::object py_matmul(nb::handle fa, nb::handle fb, int64_t nbatch, int64_
         std::vector<FV<u128>> qa, qb;
         int64_t ba, bb;
         if (parse_fast(fa, qa, ba) && parse_fast(fb, qb, bb) && ba <= kLeanBits && bb <= kLeanBits &&
-            qa.size() == (size_t)((batch_a ? nbatch : 1) * m * k) &&
-            qb.size() == (size_t)((batch_b ? nbatch : 1) * k * n) && (size_t)k < (size_t(1) << kExactMaxLog2K)) {
+            qa.size() == need_a && qb.size() == need_b && (size_t)k < (size_t(1) << kExactMaxLog2K)) {
             LeanOperands A, B;
             A.assign(qa);
             B.assign(qb);
@@ -1005,6 +1010,8 @@ static nb::object py_matmul(nb::handle fa, nb::handle fb, int64_t nbatch, int64_
         if (parsed) return true;
         bool nf = false, nums = false;
         if (!parse_all(fa, va, nf, nums) || !parse_all(fb, vb, nf, nums)) return false;
+        if (va.size() != need_a || vb.size() != need_b)
+            raise(PyExc_ValueError, "operand sizes do not match the matmul dimensions");
         if (exact ? nf : (nf && nums)) return false;   // the reference raises its own error
         parsed = true;
         return true;

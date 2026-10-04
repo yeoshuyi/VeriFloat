@@ -9,11 +9,8 @@ after rounding, which is what x86 does. NaN results follow NaNMode.X86.
 from __future__ import annotations
 
 import ctypes
-import hashlib
-import os
 import platform
 import shutil
-import subprocess
 from pathlib import Path
 
 import pytest
@@ -21,6 +18,7 @@ import pytest
 from verifloat import FP32, FP64, FPFlags, NaNMode, Rounding
 from conftest import COMPARED
 from test_external import rand_bits
+from testfloat_build import shared_library
 
 pytestmark = pytest.mark.skipif(
     platform.machine().lower() not in ("x86_64", "amd64") or not shutil.which("gcc"),
@@ -35,14 +33,7 @@ MXCSR_FLAGS = [(0, FPFlags.INVALID), (2, FPFlags.DIVZERO), (3, FPFlags.OVERFLOW)
 
 @pytest.fixture(scope="module")
 def hw():
-    cache = Path(os.environ.get("VERIFLOAT_CACHE", Path.home() / ".cache" / "verifloat"))
-    digest = hashlib.sha256(SRC.read_bytes()).hexdigest()[:12]
-    lib = cache / f"hwfpu-{digest}.so"
-    if not lib.exists():
-        lib.parent.mkdir(parents=True, exist_ok=True)
-        subprocess.run(["gcc", "-O1", "-shared", "-fPIC", "-o", str(lib), str(SRC)],
-                       check=True)
-    so = ctypes.CDLL(str(lib))
+    so = ctypes.CDLL(str(shared_library(SRC, "hwfpu")))
     for name, t in (("op32", ctypes.c_uint32), ("op64", ctypes.c_uint64)):
         f = getattr(so, name)
         f.restype = t

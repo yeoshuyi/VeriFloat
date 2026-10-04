@@ -54,6 +54,8 @@ class IntFormat:
             raise TypeError("rounding must be a Rounding member")
         if not isinstance(self.frac_bits, int) or self.frac_bits < 0:
             raise ValueError("frac_bits must be a non-negative integer")
+        if self.bits > 1 << 24 or self.frac_bits > 1 << 24:
+            raise OverflowError("integer element widths above 2**24 bits are not supported")
 
     @property
     def unit(self) -> Fraction:

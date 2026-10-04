@@ -109,9 +109,17 @@ def test_raw_codes_from_buffers(rng):
         assert FPArray.from_raw(x, f) == want
         assert FPArray.from_raw(x.astype(np.uint64), f) == want
         assert FPArray.from_raw(x.reshape(5, 8).T, f) == FPArray.from_raw(x.reshape(5, 8).T.tolist(), f)
-        # signed dtypes and codes wider than the format: the low bits, as for Python ints
-        signed = x.astype(np.int64) - (1 << 20)
-        assert FPArray.from_raw(signed, f) == FPArray.from_raw(signed.tolist(), f)
+        # Codes that do not fit the format are refused, from a buffer as from a
+        # list; a signed array exactly as wide as the format holds bit patterns.
+        for bad in ([-1], [1 << f.size] if f.size < 64 else [1 << 64]):
+            if f.size < 64:      # an int64 array is a 64-bit format's bit patterns
+                with pytest.raises(ValueError, match="does not fit"):
+                    FPArray.from_raw(np.array(bad, dtype=np.int64), f)
+            with pytest.raises(ValueError, match="does not fit"):
+                FPArray.from_raw(bad, f)
+        if f.size in (8, 16, 32, 64):
+            as_signed = x.view({8: np.int8, 16: np.int16, 32: np.int32, 64: np.int64}[f.size])
+            assert FPArray.from_raw(as_signed, f) == want
     with pytest.raises(TypeError, match="ints"):
         FPArray.from_raw(np.array([1.5]), FP16)
 

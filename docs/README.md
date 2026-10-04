@@ -180,7 +180,7 @@ matmul(a, a, acc=Accumulator(FP32, "sequential"))  # an FPArray in FP32
 a.to_numpy(), a.to_numpy("raw"), a.to_numpy("flags")   # float64 values, codes (uint16 here), flags per element
 ```
 
-- **Construction.** `FPArray(values, fmt)` and `fmt.array(values)` round numbers or FP values, taken from nested lists or from a numeric buffer (a NumPy array of floats or integers of any layout, `array.array`, a `memoryview`). `FPArray.from_raw(codes, fmt)` takes encodings, as lists or an integer array. `FPArray.full(shape, value, fmt)`, `zeros` and `ones` repeat one rounded value.
+- **Construction.** `FPArray(values, fmt)` and `fmt.array(values)` round numbers or FP values, taken from nested lists or from a numeric buffer (a NumPy array of floats or integers of any layout, `array.array`, a `memoryview`). `FPArray.from_raw(codes, fmt)` takes encodings, as lists or an integer array. A code must fit the format (0 ≤ code < 2**size; anything else raises `ValueError` rather than being cut to its low bits), except that a signed integer array exactly as wide as the format is read as bit patterns (FP16 codes in `int16`). `FPArray.full(shape, value, fmt)`, `zeros` and `ones` repeat one rounded value.
 - **NumPy is optional.** `to_numpy("value" | "raw" | "flags")` returns new arrays; nothing converts implicitly, because float64 cannot hold every format's values.
 - **Indexing** with integers gives an `FP` (with its own flags); slices, `...` and `None` select sub-arrays as in NumPy. The result is always a copy, arrays cannot be modified, and an array cannot be empty (a slice that selects nothing raises `IndexError`). `==` is bit-exact equality of whole arrays.
 - **Broadcasting.** The operators and the element-wise methods take operands of different shapes by NumPy's rule (shapes aligned at the last axis, axes of length 1 repeated).
@@ -421,12 +421,12 @@ FFFF,4248,BE03,7E00,00
 3FEE,4F65,E61A,E5DF,01
 
 $ python -m verifloat.vectors generate --op div --fmt FP16 --count 2 --format jsonl
-{"verifloat_vectors": 1, "version": "0.1.0", "op": "div", "fmt": "e5m10", "seed": 0, "style": "mixed", "count": 2}
+{"verifloat_vectors": 1, "version": "0.2.0", "op": "div", "fmt": "e5m10", "seed": 0, "style": "mixed", "count": 2}
 {"a": "FFFF", "b": "4248", "result": "7E00", "flags": "00"}
 {"a": "C001", "b": "BC02", "result": "3FFE", "flags": "01"}
 
 $ python -m verifloat.vectors generate --op sqrt --fmt "e5m2, rtz" --count 3 --format readmemh --seed 3
-// version: 0.1.0
+// version: 0.2.0
 // op: sqrt
 ...
 // localparam int VEC_A_LSB = 13;  // [20:13] a, 8 bits
@@ -607,7 +607,10 @@ See [Validation](#validation) for how each path is checked against the others an
 
 ## Limitations
 
-- **Format limits:** `exp_bits` ≤ 60, \|`bias`\| ≤ 2⁶⁰, `mantissa_bits` ≤ 2²⁴, `sr_bits` ≤ 2²⁰. Version 0.1 had no limits, but formats near them were unusably slow there anyway.
+- **Format limits:** `exp_bits` ≤ 60, \|`bias`\| ≤ 2⁶⁰, `mantissa_bits` ≤ 2²⁴, `sr_bits` ≤ 2²⁰. Integer and fixed-point widths (`UINT`/`INT` bits, `to_int` bits, `FixedFormat` and `IntFormat` widths) are at most 2²⁴ bits. Version 0.1 had no limits, but formats near them were unusably slow there anyway.
+- **Array limits:** an `FPArray` has at most 64 axes (NumPy's limit) and 2⁴⁸ elements; nested lists deeper than 64 levels, or that contain themselves, are refused. Larger requests raise `ValueError` before any memory is allocated.
+- **Raw codes** passed to `from_raw` must fit the format: a code with bits above the format's width raises `ValueError`. (Version 0.1 and earlier 0.2 builds kept the low bits silently.)
+- **Pickling** `FP`, `FPArray` and the other types works, but as with any pickle, load only data you trust: unpickling can run arbitrary code.
 - **Missing:** decimal formats, and the IEEE transcendental functions (`exp`, `log`, `pow` ...).
 - **`BlockTensor` is list-based** and suited to the tensor sizes of unit tests (hundreds to thousands of elements).
 - **`FPArray`** holds formats of at most 64 bits, is immutable (indexing copies, there is no item assignment) and cannot be empty. Fancy indexing (index arrays, boolean masks) is not supported. Only `+ − × ÷`, conversion, construction and `matmul`/`dot` have fast kernels; the other element-wise methods and `sum` run the scalar operation per element. Mixing array formats works when the promoted format still fits 64 bits.

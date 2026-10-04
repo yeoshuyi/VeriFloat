@@ -19,6 +19,7 @@ from .fp import FP, FPFlags, Rounding, _ROUNDINGS, _pow2  # noqa: F401
 from .uint import UINT  # noqa: F401
 
 _F = FPFlags
+_MAX_BITS = 1 << 24          # widest format (bits), as mantissa_bits is capped for FP
 
 
 @dataclass(frozen=True)
@@ -39,6 +40,8 @@ class FixedFormat(_core.FixedBase):
                 raise TypeError(f"{name} must be an int")
         if self.bits < 1 or (self.signed and self.bits < 1):
             raise ValueError("a fixed-point format needs at least 1 bit")
+        if max(abs(self.int_bits), abs(self.frac_bits), self.bits) > _MAX_BITS:
+            raise OverflowError("fixed-point widths above 2**24 bits are not supported")
         if self.overflow not in ("wrap", "saturate"):
             raise ValueError("overflow must be 'wrap' or 'saturate'")
         if not isinstance(self.rounding, Rounding) or self.rounding is Rounding.SR:

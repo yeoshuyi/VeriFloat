@@ -18,12 +18,11 @@ MXCSR and the x87 control word); needs gcc.
 from __future__ import annotations
 
 import ctypes
-import hashlib
 import os
 import platform
 import shutil
 import struct
-import subprocess
+import sys
 import warnings
 from fractions import Fraction
 from pathlib import Path
@@ -39,9 +38,13 @@ pytestmark = pytest.mark.skipif(
 
 from verifloat import (E4M3, FP16, FP32, FP64, NVFP4, Accumulator, BlockTensor, FixedFormat, FPArray,  # noqa: E402
                        FPFormat, Rounding, dot, dpi, matmul)
+from testfloat_build import shared_library  # noqa: E402
 
 SRC = Path(__file__).parent / "native" / "fpstate.c"
-DEFAULT_MXCSR, DEFAULT_CW = 0x1F80, 0x037F
+# The state a process starts in: all exceptions masked, round to nearest; the
+# x87 at 64-bit precision, except on 64-bit Windows, which starts it at 53.
+DEFAULT_MXCSR = 0x1F80
+DEFAULT_CW = 0x027F if sys.platform == "win32" else 0x037F
 DAZ, FTZ = 1 << 6, 1 << 15
 STATES = {
     "flush-to-zero and denormals-are-zero (-ffast-math)": dict(mxcsr=DEFAULT_MXCSR | DAZ | FTZ),
@@ -57,12 +60,7 @@ STATES = {
 
 @pytest.fixture(scope="module")
 def fp():
-    cache = Path(os.environ.get("VERIFLOAT_CACHE", Path.home() / ".cache" / "verifloat"))
-    lib = cache / f"fpstate-{hashlib.sha256(SRC.read_bytes()).hexdigest()[:12]}.so"
-    if not lib.exists():
-        lib.parent.mkdir(parents=True, exist_ok=True)
-        subprocess.run(["gcc", "-O1", "-shared", "-fPIC", "-o", str(lib), str(SRC)], check=True)
-    so = ctypes.CDLL(str(lib))
+    so = ctypes.CDLL(str(shared_library(SRC, "fpstate")))
     so.get_mxcsr.restype = ctypes.c_uint
     so.get_x87_cw.restype = ctypes.c_ushort
     so.set_x87_cw.argtypes = [ctypes.c_ushort]

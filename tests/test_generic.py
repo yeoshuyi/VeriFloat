@@ -12,6 +12,7 @@ from verifloat import (E2M1, E4M3, E5M2, FP, FP16, FP32, INT, UINT, CastWarning,
                        FPFlags, FPFormat, FPFormatWarning, FPModeWarning,
                        FPOverflowWarning, FPUnderflowWarning, IntCastWarning,
                        NaNMode, Rounding)
+from conftest import IMPL
 from reference import (ROUNDINGS, Fmt, Val, assert_ref, caught, check_fp_ops, default_bias,
                        NoNaN, ref_compare, ref_fma, ref_minmax, ref_round_int, ref_sqrt,
                        ref_to_int,
@@ -275,7 +276,12 @@ def test_fp_custom_bias():
 def test_fp_unsigned():
     u = FP.from_value(4, 2, 1, signed=False, inf_nan=False)
     assert (u.size, u.signed, repr(u), u.to_bin()) == (3, False, "FP(4.0, ue2m1, finite)", "11 0")
-    assert FP.from_raw(0b1111, 2, 1, signed=False, inf_nan=False).raw == 0b111
+    assert FP.from_raw(0b111, 2, 1, signed=False, inf_nan=False).raw == 0b111
+    if IMPL == "py":     # 0.1 kept the low bits of a code too wide for the format
+        assert FP.from_raw(0b1111, 2, 1, signed=False, inf_nan=False).raw == 0b111
+    else:                # since then it refuses it, a sign bit included
+        with pytest.raises(ValueError, match="does not fit"):
+            FP.from_raw(0b1111, 2, 1, signed=False, inf_nan=False)
     assert FP.from_value(-0.0, 2, 1, signed=False, inf_nan=False).raw == 0
     assert float(u - 1) == 3.0            # scalar keeps its sign
     with pytest.raises(ValueError):

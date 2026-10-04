@@ -126,7 +126,9 @@ VF_API double vf_to_double(const vf_fmt* f, uint64_t a);   /* correctly rounded,
 
 /* ---- stochastic rounding ---- */
 /* The random bits (sr_bits of them) each rounding of an "sr" format uses:
- * a fixed value until changed, or a callback. */
+ * a fixed value until changed, or a callback. One setting for the whole
+ * process; safe to change from any thread. The callback may be called from
+ * any thread that rounds, and must be safe for that itself. */
 VF_API void vf_set_sr(uint64_t bits);
 VF_API void vf_set_sr_source(uint64_t (*source)(int bits, void* ctx), void* ctx);
 

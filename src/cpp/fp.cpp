@@ -496,8 +496,9 @@ static nb::object raw_of(const Code& c, const Fmt& f) {
     return long_from_big(r);
 }
 
-// FP._from_raw_fmt(raw, fmt)
-static Code code_from_raw(PyObject* raw, const Fmt& f) {
+// The low size+1 bits of any int as a code, two's complement: the result of
+// the bit operators, which work on Python ints.
+static Code code_wrapped(PyObject* raw, const Fmt& f) {
     int overflow = 0;
     long long x = PyLong_AsLongLongAndOverflow(raw, &overflow);
     if (x == -1 && PyErr_Occurred()) raise_current();
@@ -531,7 +532,7 @@ static PyObject* bitop(PyObject* x, PyObject* y, char op) {
                 : op == '|' ? PyNumber_Or(ra.ptr(), rb.ptr())
                             : PyNumber_Xor(ra.ptr(), rb.ptr());
     nb::object raw = steal_checked(r);
-    return fp_plain(c.fmt, code_from_raw(raw.ptr(), fmt_of(c.fmt))).release().ptr();
+    return fp_plain(c.fmt, code_wrapped(raw.ptr(), fmt_of(c.fmt))).release().ptr();
     VF_CATCH(nullptr)
 }
 static PyObject* fp_and(PyObject* a, PyObject* b) { return bitop(a, b, '&'); }
@@ -547,7 +548,7 @@ static PyObject* fp_invert(PyObject* s) {
     m = steal_checked(PyNumber_Subtract(m.ptr(), nb::int_(1).ptr()));
     nb::object inv = steal_checked(PyNumber_Invert(raw.ptr()));
     inv = steal_checked(PyNumber_And(inv.ptr(), m.ptr()));
-    return fp_plain(self->fmt, code_from_raw(inv.ptr(), f)).release().ptr();
+    return fp_plain(self->fmt, code_wrapped(inv.ptr(), f)).release().ptr();
     VF_CATCH(nullptr)
 }
 
@@ -650,6 +651,14 @@ static nb::object to_int_impl(PyFP* self, PyObject* bits, PyObject* signed_o, Py
     bool is_signed = PyObject_IsTrue(signed_o);
     bool want_exact = PyObject_IsTrue(exact_o);
     PyObject* cls = (PyObject*)(is_signed ? S.INT : S.UINT);
+    // A width beyond the integer types' limit is refused before the bounds
+    // below are built from it (1 << bits would take memory without bound).
+    if (PyLong_Check(bits)) {
+        int overflow = 0;
+        const long long n = PyLong_AsLongLongAndOverflow(bits, &overflow);
+        if (n == -1 && PyErr_Occurred()) raise_current();
+        if (overflow > 0 || n > kMaxIntBits) raise(PyExc_OverflowError, "bits above 2**24 is not supported");
+    }
     if (PyLong_CheckExact(bits)) {
         int overflow = 0;
         long long n = PyLong_AsLongLongAndOverflow(bits, &overflow);
@@ -1280,6 +1289,10 @@ static PyObject* fmtbase_setup(PyObject* s, PyObject* args) {
     if (bias > (1LL << 60) || bias < -(1LL << 60)) raise(PyExc_ValueError, "|bias| above 2**60 is not supported");
     if (sr_bits > (1LL << 20)) raise(PyExc_ValueError, "sr_bits above 2**20 is not supported");
     if (M > (1LL << 24)) raise(PyExc_ValueError, "mantissa_bits above 2**24 is not supported");
+    // FPFormat checks all of this first; the native base is not trusted to
+    // be called only from there (the enums index name tables).
+    if (E < 1 || M < 0 || sr_bits < 1 || inf_nan < 0 || inf_nan > 2 || rnd < 0 || rnd > 5 || nm < 0 || nm > 3)
+        raise(PyExc_ValueError, "bad FP format fields");
     Fmt& f = ((PyFormat*)s)->f;
     f.E = E; f.M = M; f.bias = bias; f.is_signed = sg;
     f.inf_nan = (uint8_t)inf_nan; f.has_zero = hz; f.saturate = sat; f.wrap = wrap; f.ftz = ftz;
@@ -1331,9 +1344,20 @@ static nb::object fp_make(nb::handle fmt, bool sign, nb::handle field, nb::handl
     return fp_plain(fmt.ptr(), c);
 }
 
+// FPFormat.from_raw(raw): a code is an int in [0, 2**size). Any other int is
+// refused rather than cut to its low bits, which would hide the bits a DUT
+// drove above the format.
 static nb::object fp_from_raw(nb::handle fmt, nb::handle raw) {
     if (!is_format(fmt.ptr())) raise(PyExc_TypeError, "expected an FPFormat");
-    return fp_plain(fmt.ptr(), code_from_raw(raw.ptr(), fmt_of(fmt.ptr())));
+    const Fmt& f = fmt_of(fmt.ptr());
+    if (!PyLong_Check(raw.ptr())) raise(PyExc_TypeError, "a raw code must be an int");
+    nb::object zero = nb::int_(0);
+    const int neg = PyObject_RichCompareBool(raw.ptr(), zero.ptr(), Py_LT);
+    if (neg < 0) raise_current();
+    if (neg || long_bitlen(raw.ptr()) > f.size)
+        raise(PyExc_ValueError, "raw code " + py_repr(raw.ptr()) + " does not fit the " + std::to_string(f.size) +
+                                    " bits of " + fmt_str(f));
+    return fp_plain(fmt.ptr(), code_wrapped(raw.ptr(), f));
 }
 
 // Restore a pickled FP: from_raw plus flags and unrounded.

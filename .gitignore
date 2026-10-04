@@ -33,3 +33,7 @@ results.xml
 
 # Native build output
 *.so
+
+# Release builds
+/corpus/
+wheelhouse/

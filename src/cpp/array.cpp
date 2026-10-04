@@ -37,16 +37,18 @@ static void check_array_format(PyObject* fmt) {
 
 static PyFPArray* array_new(PyObject* fmt, std::vector<int64_t> shape) {
     check_array_format(fmt);
+    const size_t n = checked_count(shape);   // before anything is allocated
+    // The storage first: if it cannot be had, no half-built object exists.
+    std::vector<uint64_t> raw(n);
+    std::vector<uint8_t> flags(n);
     PyTypeObject* t = g_array_type;
     PyFPArray* o = (PyFPArray*)t->tp_alloc(t, 0);
     if (!o) raise_current();
     Py_INCREF(fmt);
     o->fmt = fmt;
     o->f = &fmt_of(fmt);
-    size_t n = 1;
-    for (int64_t d : shape) n *= (size_t)d;
-    new (&o->raw) std::vector<uint64_t>(n);
-    new (&o->flags) std::vector<uint8_t>(n);
+    new (&o->raw) std::vector<uint64_t>(std::move(raw));      // moves do not throw
+    new (&o->flags) std::vector<uint8_t>(std::move(flags));
     new (&o->shape) std::vector<int64_t>(std::move(shape));
     return o;
 }
@@ -74,10 +76,14 @@ static inline nb::object elem_fp(const PyFPArray* a, size_t i) {
 
 // ---------------------------------------------------------------- nested lists
 
-// Shape and leaves (borrowed) of nested lists/tuples.
-static void walk(PyObject* o, size_t depth, std::vector<int64_t>& shape, std::vector<PyObject*>& leaves,
+// Shape and leaves of nested lists/tuples. The leaves are held as strong
+// references: converting one may run Python code that changes the lists. No
+// Python code runs during the walk itself. The depth is limited, which also
+// stops a list that contains itself.
+static void walk(PyObject* o, size_t depth, std::vector<int64_t>& shape, std::vector<nb::object>& leaves,
                  bool& shape_known) {
     if (PyList_Check(o) || PyTuple_Check(o)) {
+        if (depth >= kMaxDims) raise(PyExc_ValueError, "too many dimensions (at most 64), or a list that contains itself");
         Py_ssize_t n = PySequence_Fast_GET_SIZE(o);
         if (n == 0) raise(PyExc_ValueError, "empty tensor");
         if (depth == shape.size()) {
@@ -91,10 +97,10 @@ static void walk(PyObject* o, size_t depth, std::vector<int64_t>& shape, std::ve
     }
     if (depth != shape.size()) raise(PyExc_ValueError, "ragged nested lists: all rows must have the same shape");
     shape_known = true;
-    leaves.push_back(o);
+    leaves.push_back(nb::borrow(o));
 }
 
-static void flatten(PyObject* values, std::vector<int64_t>& shape, std::vector<PyObject*>& leaves) {
+static void flatten(PyObject* values, std::vector<int64_t>& shape, std::vector<nb::object>& leaves) {
     bool known = false;
     walk(values, 0, shape, leaves, known);
     if (shape.empty()) raise(PyExc_TypeError, "expected nested lists of values, not a scalar");
@@ -117,11 +123,7 @@ static nb::object shape_tuple(const std::vector<int64_t>& shape) {
 
 static std::string shape_str(const std::vector<int64_t>& shape) { return py_repr(shape_tuple(shape).ptr()); }
 
-static size_t count_of(const std::vector<int64_t>& shape) {
-    size_t n = 1;
-    for (int64_t d : shape) n *= (size_t)d;
-    return n;
-}
+static size_t count_of(const std::vector<int64_t>& shape) { return checked_count(shape); }
 
 // ---------------------------------------------------------------- broadcasting
 
@@ -220,11 +222,12 @@ struct NumBuffer {
             return false;
         }
         if (view.ndim == 0) raise(PyExc_TypeError, "expected nested lists of values, not a scalar");
+        if ((size_t)view.ndim > kMaxDims) raise(PyExc_ValueError, "too many dimensions (at most 64)");
         n = 1;
         for (int d = 0; d < view.ndim; ++d) {
             if (view.shape[d] == 0) raise(PyExc_ValueError, "empty tensor");
             shape.push_back(view.shape[d]);
-            n *= (size_t)view.shape[d];
+            n = elems_mul(n, (size_t)view.shape[d]);   // a broadcast view can claim any size
         }
         return true;
     }
@@ -396,7 +399,7 @@ static PyObject* array_tp_new(PyTypeObject*, PyObject* args, PyObject* kwargs) {
     }
     nb::object lists = as_lists(values);
     std::vector<int64_t> shape;
-    std::vector<PyObject*> leaves;
+    std::vector<nb::object> leaves;
     flatten(lists.ptr(), shape, leaves);
     PyFPArray* a = array_new(fmt, shape);
     nb::object hold = nb::steal((PyObject*)a);
@@ -410,8 +413,8 @@ static PyObject* array_tp_new(PyTypeObject*, PyObject* args, PyObject* kwargs) {
         const size_t W = simd->width;
         std::vector<uint8_t> redo(n / W + 1);
         for (size_t i = 0; i < n; ++i) {
-            if (PyFloat_CheckExact(leaves[i])) {
-                const double d = PyFloat_AS_DOUBLE(leaves[i]);
+            if (PyFloat_CheckExact(leaves[i].ptr())) {
+                const double d = PyFloat_AS_DOUBLE(leaves[i].ptr());
                 std::memcpy(&bits[i], &d, 8);
             } else bits[i] = ~uint64_t(0);
         }
@@ -421,22 +424,32 @@ static PyObject* array_tp_new(PyTypeObject*, PyObject* args, PyObject* kwargs) {
             if (!redo[v]) continue;
             for (size_t l = 0; l < W; ++l)
                 if ((redo[v] >> l) & 1) {
-                    quantize_elem(a, v * W + l, leaves[v * W + l], fast);
+                    quantize_elem(a, v * W + l, leaves[v * W + l].ptr(), fast);
                     ++again;
                 }
         }
         g_fast_hits += n - again;
     } else
-        for (size_t i = 0; i < leaves.size(); ++i) quantize_elem(a, i, leaves[i], fast);
+        for (size_t i = 0; i < leaves.size(); ++i) quantize_elem(a, i, leaves[i].ptr(), fast);
     return hold.release().ptr();
     VF_CATCH(nullptr)
 }
 
+[[noreturn]] static void raw_out_of_range(const std::string& v, const Fmt& f) {
+    raise(PyExc_ValueError, "raw code " + v + " does not fit the " + std::to_string(f.size) + " bits of " + fmt_str(f));
+}
+
+// A raw code: an int in [0, 2**size), as FPFormat.from_raw takes it.
 static uint64_t raw_from_long(PyObject* o, const Fmt& f) {
     if (!PyLong_Check(o)) raise(PyExc_TypeError, "raw codes must be ints");
-    uint64_t x = PyLong_AsUnsignedLongLongMask(o);
-    if (x == (uint64_t)-1 && PyErr_Occurred()) raise_current();
-    return f.size >= 64 ? x : x & ((uint64_t(1) << f.size) - 1);
+    const uint64_t x = PyLong_AsUnsignedLongLong(o);   // OverflowError if negative or above 64 bits
+    if (x == (uint64_t)-1 && PyErr_Occurred()) {
+        if (!PyErr_ExceptionMatches(PyExc_OverflowError)) raise_current();
+        PyErr_Clear();
+        raw_out_of_range(py_repr(o), f);
+    }
+    if (f.size < 64 && (x >> f.size) != 0) raw_out_of_range(std::to_string(x), f);
+    return x;
 }
 
 // FPArray.from_raw(codes, fmt)
@@ -449,19 +462,28 @@ static PyObject* m_from_raw(PyObject*, PyObject* const* args, Py_ssize_t nargs, 
     if (buf.open(a[0])) {
         if (buf.kind == 'f') raise(PyExc_TypeError, "raw codes must be ints");
         PyFPArray* r = array_new(a[1], buf.shape);
+        nb::object hold = nb::steal((PyObject*)r);
         const Fmt& f = *r->f;
-        const uint64_t mask = f.size >= 64 ? ~uint64_t(0) : (uint64_t(1) << f.size) - 1;
+        // Codes in [0, 2**size). A signed array as wide as the format holds
+        // the codes as its bit patterns (FP16 codes in int16), and is read so.
+        const bool bit_patterns = buf.kind == 'i' && buf.view.itemsize * 8 == f.size;
         size_t i = 0;
-        buf.for_each([&](const char* p) { r->raw[i++] = buf.as_bits(p) & mask; });
-        return (PyObject*)r;
+        buf.for_each([&](const char* p) {
+            const uint64_t v = bit_patterns ? buf.load(p) : buf.as_bits(p);
+            const bool neg = !bit_patterns && buf.kind == 'i' && (int64_t)v < 0;
+            if (neg || (f.size < 64 && (v >> f.size) != 0))
+                raw_out_of_range(neg ? std::to_string((int64_t)v) : std::to_string(v), f);
+            r->raw[i++] = v;
+        });
+        return hold.release().ptr();
     }
     nb::object lists = as_lists(a[0]);
     std::vector<int64_t> shape;
-    std::vector<PyObject*> leaves;
+    std::vector<nb::object> leaves;
     flatten(lists.ptr(), shape, leaves);
     PyFPArray* r = array_new(a[1], shape);
     nb::object hold = nb::steal((PyObject*)r);
-    for (size_t i = 0; i < leaves.size(); ++i) r->raw[i] = raw_from_long(leaves[i], *r->f);
+    for (size_t i = 0; i < leaves.size(); ++i) r->raw[i] = raw_from_long(leaves[i].ptr(), *r->f);
     return hold.release().ptr();
     VF_CATCH(nullptr)
 }
@@ -578,7 +600,9 @@ static PyObject* array_index(PyFPArray* a, PyObject* const* idx, size_t n) {
             if (count == 0) raise(PyExc_IndexError, "slice selects no elements (an FPArray cannot be empty)");
             base += (int64_t)start * stride[d];
             oshape.push_back(count);
-            ostep.push_back((int64_t)step * stride[d]);
+            // With two or more elements |step| < the axis length, so this
+            // stays within the array; a single element never steps.
+            ostep.push_back(count > 1 ? (int64_t)step * stride[d] : 0);
             ++d;
         } else {
             if (!PyIndex_Check(key) || PyBool_Check(key))
@@ -702,12 +726,13 @@ static PyObject* m_reshape(PyObject* s, PyObject* args) {
     PyFPArray* a = (PyFPArray*)s;
     if (PyTuple_GET_SIZE(args) == 1 && (PyTuple_Check(PyTuple_GET_ITEM(args, 0)) || PyList_Check(PyTuple_GET_ITEM(args, 0))))
         args = PyTuple_GET_ITEM(args, 0);
-    nb::object seq = steal_checked(PySequence_Fast(args, "shape must be a sequence of ints"));
+    nb::object seq = snapshot(args, "shape must be a sequence of ints");
+    if ((size_t)tuple_size(seq) > kMaxDims) raise(PyExc_ValueError, "too many dimensions (at most 64)");
     std::vector<int64_t> shape;
     size_t total = 1;
     Py_ssize_t infer = -1;      // the axis given as -1: its length follows from the others
-    for (Py_ssize_t i = 0; i < PySequence_Fast_GET_SIZE(seq.ptr()); ++i) {
-        Py_ssize_t d = PyNumber_AsSsize_t(PySequence_Fast_GET_ITEM(seq.ptr(), i), PyExc_OverflowError);
+    for (Py_ssize_t i = 0; i < tuple_size(seq); ++i) {
+        Py_ssize_t d = PyNumber_AsSsize_t(tuple_item(seq, i), PyExc_OverflowError);
         if (d == -1 && PyErr_Occurred()) raise_current();
         if (d == -1 && infer < 0) {
             infer = i;
@@ -715,7 +740,7 @@ static PyObject* m_reshape(PyObject* s, PyObject* args) {
         } else if (d < 1)
             raise(PyExc_ValueError, "shape dimensions must be positive (or one -1)");
         shape.push_back(d);
-        total *= (size_t)d;
+        total = elems_mul(total, (size_t)d);
     }
     if (infer >= 0 && a->raw.size() % total == 0) {
         shape[(size_t)infer] = (int64_t)(a->raw.size() / total);
@@ -751,9 +776,10 @@ static std::vector<int64_t> shape_arg(PyObject* arg) {
         shape.push_back(PyNumber_AsSsize_t(arg, PyExc_OverflowError));
         if (shape[0] == -1 && PyErr_Occurred()) raise_current();
     } else {
-        nb::object seq = steal_checked(PySequence_Fast(arg, "shape must be an int or a sequence of ints"));
-        for (Py_ssize_t i = 0; i < PySequence_Fast_GET_SIZE(seq.ptr()); ++i) {
-            const Py_ssize_t d = PyNumber_AsSsize_t(PySequence_Fast_GET_ITEM(seq.ptr(), i), PyExc_OverflowError);
+        nb::object seq = snapshot(arg, "shape must be an int or a sequence of ints");
+        if ((size_t)tuple_size(seq) > kMaxDims) raise(PyExc_ValueError, "too many dimensions (at most 64)");
+        for (Py_ssize_t i = 0; i < tuple_size(seq); ++i) {
+            const Py_ssize_t d = PyNumber_AsSsize_t(tuple_item(seq, i), PyExc_OverflowError);
             if (d == -1 && PyErr_Occurred()) raise_current();
             shape.push_back(d);
         }
@@ -761,6 +787,7 @@ static std::vector<int64_t> shape_arg(PyObject* arg) {
     if (shape.empty()) raise(PyExc_ValueError, "an FPArray has at least one axis");
     for (int64_t d : shape)
         if (d < 1) raise(PyExc_ValueError, "shape dimensions must be positive");
+    checked_count(shape);
     return shape;
 }
 
@@ -974,14 +1001,19 @@ static nb::object py_array_matmul(nb::handle ha, nb::handle hb, int64_t nbatch, 
     AccSpec spec;
     if (!spec_from(acc, spec)) raise(PyExc_TypeError, "acc must be an FPFormat or an Accumulator");
     MatDims d{nbatch, m, k, n, batch_a, batch_b};
-    if (A->raw.size() != (size_t)((batch_a ? nbatch : 1) * m * k) ||
-        B->raw.size() != (size_t)((batch_b ? nbatch : 1) * k * n))
+    if (nbatch < 1 || m < 1 || k < 1 || n < 1) raise(PyExc_ValueError, "matmul dimensions must be positive");
+    const size_t ua = (size_t)(batch_a ? nbatch : 1), ub = (size_t)(batch_b ? nbatch : 1);
+    if (A->raw.size() != elems_mul(elems_mul(ua, (size_t)m), (size_t)k) ||
+        B->raw.size() != elems_mul(elems_mul(ub, (size_t)k), (size_t)n))
         raise(PyExc_ValueError, "operand sizes do not match the matmul dimensions");
+    nb::object sh = snapshot(shape.ptr(), "shape must be a sequence of ints");
     std::vector<int64_t> oshape;
-    for (nb::handle h : shape) oshape.push_back(nb::cast<int64_t>(h));
+    for (Py_ssize_t i = 0; i < tuple_size(sh); ++i)
+        oshape.push_back(int_in(tuple_item(sh, i), 1, INT64_MAX, "bad matmul result shape"));
     PyFPArray* R = array_new(spec.fmt, oshape);
     nb::object hold = nb::steal((PyObject*)R);
-    if (R->raw.size() != d.outputs()) raise(PyExc_ValueError, "result shape does not match the matmul dimensions");
+    if (R->raw.size() != elems_mul(elems_mul((size_t)nbatch, (size_t)m), (size_t)n))
+        raise(PyExc_ValueError, "result shape does not match the matmul dimensions");
 
     std::vector<uint8_t> ok;
     bool fast = false;
@@ -1034,9 +1066,11 @@ static nb::object py_array_matmul(nb::handle ha, nb::handle hb, int64_t nbatch, 
 // (the comparisons) give (nested lists of the values, the OR of the flags);
 // other results give nested lists.
 static nb::object py_array_map(nb::handle name, nb::handle operands) {
-    nb::object seq = steal_checked(PySequence_Fast(operands.ptr(), "operands must be a sequence"));
-    const size_t n = (size_t)PySequence_Fast_GET_SIZE(seq.ptr());
-    PyObject** items = PySequence_Fast_ITEMS(seq.ptr());
+    // A tuple: the methods called below run Python code, which must not be
+    // able to change the operands under this loop.
+    nb::object seq = snapshot(operands.ptr(), "operands must be a sequence");
+    const size_t n = (size_t)tuple_size(seq);
+    PyObject** items = &PyTuple_GET_ITEM(seq.ptr(), 0);
     if (n < 1 || !is_array(items[0])) raise(PyExc_TypeError, "expected an FPArray");
     std::vector<int64_t> shape = ((PyFPArray*)items[0])->shape;
     for (size_t i = 1; i < n; ++i)
@@ -1096,9 +1130,9 @@ static nb::object py_array_map(nb::handle name, nb::handle operands) {
 // _core.array_from_fps(values, shape): an array of these FP values (one
 // format), each keeping its code and flags.
 static nb::object py_array_from_fps(nb::handle values, nb::handle shape) {
-    nb::object seq = steal_checked(PySequence_Fast(values.ptr(), "values must be a sequence of FP"));
-    const size_t n = (size_t)PySequence_Fast_GET_SIZE(seq.ptr());
-    PyObject** items = PySequence_Fast_ITEMS(seq.ptr());
+    nb::object seq = snapshot(values.ptr(), "values must be a sequence of FP");
+    const size_t n = (size_t)tuple_size(seq);
+    PyObject** items = n ? &PyTuple_GET_ITEM(seq.ptr(), 0) : nullptr;
     const std::vector<int64_t> sh = shape_arg(shape.ptr());
     if (n == 0 || count_of(sh) != n) raise(PyExc_ValueError, "the shape does not match the number of values");
     for (size_t i = 0; i < n; ++i)
@@ -1112,17 +1146,18 @@ static nb::object py_array_from_fps(nb::handle values, nb::handle shape) {
 // ---------------------------------------------------------------- pickling
 
 static nb::object py_array_restore(nb::handle fmt, nb::handle shape, nb::handle raw, nb::bytes flags) {
+    nb::object st = snapshot(shape.ptr(), "bad FPArray shape");
     std::vector<int64_t> sh;
-    for (nb::handle h : shape) sh.push_back(nb::cast<int64_t>(h));
-    for (int64_t d : sh)
-        if (d < 1) raise(PyExc_ValueError, "bad FPArray shape");
+    for (Py_ssize_t i = 0; i < tuple_size(st); ++i)
+        sh.push_back(int_in(tuple_item(st, i), 1, INT64_MAX, "bad FPArray shape"));
+    if (sh.empty()) raise(PyExc_ValueError, "bad FPArray shape");
+    nb::object seq = snapshot(raw.ptr(), "raw codes must be a sequence");
     PyFPArray* r = array_new(fmt.ptr(), sh);
     nb::object hold = nb::steal((PyObject*)r);
-    nb::object seq = steal_checked(PySequence_Fast(raw.ptr(), "raw codes must be a sequence"));
-    if ((size_t)PySequence_Fast_GET_SIZE(seq.ptr()) != r->raw.size() || flags.size() != r->raw.size() || sh.empty())
+    if ((size_t)tuple_size(seq) != r->raw.size() || flags.size() != r->raw.size())
         raise(PyExc_ValueError, "bad FPArray state");
     for (size_t i = 0; i < r->raw.size(); ++i) {
-        r->raw[i] = raw_from_long(PySequence_Fast_GET_ITEM(seq.ptr(), (Py_ssize_t)i), *r->f);
+        r->raw[i] = raw_from_long(tuple_item(seq, (Py_ssize_t)i), *r->f);
         r->flags[i] = (uint8_t)flags.c_str()[i] & 31;
     }
     return hold;

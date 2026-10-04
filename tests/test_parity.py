@@ -400,8 +400,13 @@ def test_format_api(rng):
         check(lambda m: m.FPFormat(**kw), kw)
     check(lambda m: (list(m.FPFormat(2, 1).all_values()), list(m.FP.all_values(3, 1, signed=False)),
                      m.FP.zero(3, 2, sign=True), m.FP.max_value(m.E4M3, sign=True),
-                     m.FP.from_raw(0x3c, 5, 2), m.FP.from_raw(-1, fmt=m.FP16),
-                     m.FP.from_raw(1 << 70, m.FP16)))
+                     m.FP.from_raw(0x3c, 5, 2)))
+    # A documented change: 0.1 kept the low bits of a code too wide for its
+    # format; the C++ package refuses it.
+    for raw in (-1, 1 << 16, 1 << 70):
+        assert P.FP.from_raw(raw, fmt=P.FP16).raw == raw & 0xFFFF
+        with pytest.raises(ValueError, match="does not fit"):
+            V.FP.from_raw(raw, fmt=V.FP16)
     check(lambda m: m.FP.from_value(1, m.FPFormat(2, 1), 3))
     check(lambda m: m.FP(True, m.UINT(3, 4), m.UINT(5, 3), bias=4, rounding=m.Rounding.RTZ))
     check(lambda m: m.FP(True, m.UINT(3, 4), m.UINT(5, 3), signed=False))

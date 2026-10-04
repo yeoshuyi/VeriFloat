@@ -445,6 +445,16 @@ static PyObject* fb_setup(PyObject* s, PyObject* args) {
     long long ib, fbits;
     int sg, rnd, sat;
     if (!PyArg_ParseTuple(args, "LLpip", &ib, &fbits, &sg, &rnd, &sat)) return nullptr;
+    // FixedFormat checks these first; the native base checks them again.
+    if (ib < -kMaxIntBits || ib > kMaxIntBits || fbits < -kMaxIntBits || fbits > kMaxIntBits || ib + fbits < 1 ||
+        ib + fbits > kMaxIntBits) {
+        PyErr_SetString(PyExc_OverflowError, "fixed-point widths above 2**24 bits are not supported");
+        return nullptr;
+    }
+    if (rnd < 0 || rnd > 4) {
+        PyErr_SetString(PyExc_ValueError, "bad fixed-point rounding");
+        return nullptr;
+    }
     FixFmt& f = ((PyFixFmt*)s)->f;
     f.ib = ib; f.fb = fbits; f.is_signed = sg; f.rounding = (uint8_t)rnd; f.sat = sat;
     Py_RETURN_NONE;

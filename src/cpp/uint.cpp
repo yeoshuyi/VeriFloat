@@ -436,6 +436,7 @@ static PyObject* u_new(PyTypeObject* type, PyObject* args, PyObject* kwargs) {
         nbits = b;
     }
     if (nbits < 0 || (nbits == 0 && sgn)) raise(PyExc_ValueError, "bits must be a positive integer");
+    if (nbits > kMaxIntBits) raise(PyExc_OverflowError, "bits above 2**24 is not supported");
     bool sat = false;
     if (saturate) {
         int t = PyObject_IsTrue(saturate);

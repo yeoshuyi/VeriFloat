@@ -69,6 +69,57 @@ inline PyObject* call_one(PyObject* f, PyObject* arg) {
     catch (std::bad_alloc &) { PyErr_NoMemory(); return ret; }               \
     catch (std::exception & e) { PyErr_SetString(PyExc_RuntimeError, e.what()); return ret; }
 
+// ---- input limits
+// Arrays and tensors have at most kMaxDims axes, like NumPy's 64, and at most
+// kMaxElems elements, which keeps every element count, stride and byte count
+// far from overflowing whatever axes they are made of.
+constexpr size_t kMaxDims = 64;
+constexpr size_t kMaxElems = size_t(1) << 48;
+
+// a * b, or an error if that exceeds kMaxElems.
+inline size_t elems_mul(size_t a, size_t b) {
+    if (b != 0 && a > kMaxElems / b) raise(PyExc_ValueError, "array too large (more than 2**48 elements)");
+    return a * b;
+}
+// The element count of a shape: every axis at least 1, at most kMaxDims of
+// them, at most kMaxElems in all.
+inline size_t checked_count(const std::vector<int64_t>& shape) {
+    if (shape.size() > kMaxDims) raise(PyExc_ValueError, "too many dimensions (at most 64)");
+    size_t n = 1;
+    for (int64_t d : shape) {
+        if (d < 1) raise(PyExc_ValueError, "every dimension must be at least 1");
+        n = elems_mul(n, (size_t)d);
+    }
+    return n;
+}
+
+// The items of a sequence (or any iterable) as a tuple of strong references.
+// Code that walks the items while calling back into Python uses this rather
+// than the list's own item array, which that Python code could change or free.
+inline nb::object snapshot(PyObject* o, const char* msg) {
+    PyObject* t = PySequence_Tuple(o);
+    if (!t) {
+        if (PyErr_ExceptionMatches(PyExc_TypeError)) {
+            PyErr_Clear();
+            raise(PyExc_TypeError, msg);
+        }
+        raise_current();
+    }
+    return nb::steal(t);
+}
+inline Py_ssize_t tuple_size(const nb::object& t) { return PyTuple_GET_SIZE(t.ptr()); }
+inline PyObject* tuple_item(const nb::object& t, Py_ssize_t i) { return PyTuple_GET_ITEM(t.ptr(), i); }
+
+// A Python int as an int64 in [lo, hi], else `what` in a ValueError.
+inline int64_t int_in(PyObject* o, int64_t lo, int64_t hi, const char* what) {
+    nb::object i = steal_checked(PyNumber_Index(o));
+    int overflow = 0;
+    const long long v = PyLong_AsLongLongAndOverflow(i.ptr(), &overflow);
+    if (v == -1 && PyErr_Occurred()) raise_current();
+    if (overflow || v < lo || v > hi) raise(PyExc_ValueError, what);
+    return v;
+}
+
 inline bool is_fraction(PyObject* o) {
     return Py_TYPE(o) == (PyTypeObject*)S.Fraction || PyObject_TypeCheck(o, (PyTypeObject*)S.Fraction);
 }

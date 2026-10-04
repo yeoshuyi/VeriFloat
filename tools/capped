@@ -17,6 +17,10 @@ set -euo pipefail
 MEM=${MEM:-8G}
 CPUS=${CPUS:-4}
 TIME=${TIME:-4:00:00}
+# Checked as plain text first: bash arithmetic would evaluate anything else.
+[[ $MEM =~ ^[0-9]{1,9}[KkMmGg]$ ]] || { echo "capped: MEM must be a number with a K, M or G suffix, not '$MEM'" >&2; exit 2; }
+[[ $CPUS =~ ^[0-9]{1,4}$ ]] || { echo "capped: CPUS must be a number, not '$CPUS'" >&2; exit 2; }
+[[ $TIME =~ ^[0-9:-]{1,16}$ ]] || { echo "capped: TIME must be a Slurm time such as 4:00:00, not '$TIME'" >&2; exit 2; }
 case "$MEM" in
     *[Kk]) kb=${MEM%?} ;;
     *[Mm]) kb=$(( ${MEM%?} * 1024 )) ;;

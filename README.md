@@ -42,7 +42,7 @@ for verifying RTL from [cocotb](https://www.cocotb.org/) testbenches in Python, 
 pip install verifloat
 ```
 
-Requires Python 3.12 or later, with no runtime dependencies. Building from source needs a C++20 compiler: GCC, Clang or MSVC.
+Requires Python 3.12 or later, with no runtime dependencies. Wheels are published for Linux (x86-64 and aarch64, glibc and musl), macOS (Apple silicon and Intel) and Windows (x86-64). Elsewhere pip builds from source, which needs a C++20 compiler (GCC, Clang or MSVC) and git.
 
 ## Quick start
 
@@ -111,7 +111,7 @@ VeriFloat is **alpha** (0.2), so the API may still change. It has been run bit f
 
 ## Contributing
 
-Issues and pull requests are welcome. See [CONTRIBUTING.md](https://github.com/yeoshuyi/VeriFloat/blob/main/CONTRIBUTING.md) for how to build, test and validate a change.
+Issues and pull requests are welcome. See [CONTRIBUTING.md](https://github.com/yeoshuyi/VeriFloat/blob/main/CONTRIBUTING.md) for how to build, test and validate a change. Please report security problems privately, as described in [SECURITY.md](https://github.com/yeoshuyi/VeriFloat/blob/main/SECURITY.md).
 
 ## License
 

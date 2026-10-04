@@ -17,6 +17,10 @@ endif()
 if(MSVC)
   # /bigobj: the Boost-heavy files exceed the default section limit.
   add_compile_options(/bigobj /utf-8 /Zc:__cplusplus)
+  # The C and C++ runtimes linked in (/MT): a wheel then needs no
+  # msvcp140.dll, which not every Windows machine has. No runtime object
+  # (a FILE*, memory from malloc) crosses between the modules.
+  set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 endif()
 
 find_package(Python 3.12 COMPONENTS Interpreter Development.Module REQUIRED)
@@ -34,7 +38,10 @@ if(NOT Boost_FOUND)
   # FetchContent from adding the library's own CMake project.
   FetchContent_Declare(multiprecision
     GIT_REPOSITORY https://github.com/boostorg/multiprecision.git
-    GIT_TAG Boost_1_86_0 GIT_SHALLOW TRUE
+    # Boost 1.86.0 (tag Boost_1_86_0), by commit: git checks the content
+    # against this hash, and a tag can be moved. A full clone (about 30 MB):
+    # git cannot fetch a bare commit shallowly from every server.
+    GIT_TAG bb0fd0306299d29392af5de259698b103d1b0889
     SOURCE_SUBDIR _headers_only)
   FetchContent_MakeAvailable(multiprecision)
   set(VF_MP_INCLUDE "${multiprecision_SOURCE_DIR}/include")

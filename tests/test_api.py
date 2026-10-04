@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import dataclasses
 import enum
+import importlib.metadata
 import inspect
 import os
 
@@ -65,7 +66,8 @@ def test_exported_names():
     assert V.__all__[:0] == [] and len(set(V.__all__)) == len(V.__all__)
     for name in P.__all__:
         assert hasattr(V, name), name
-    assert V.__version__ == P.__version__
+    assert P.__version__ == "0.1.0"                      # the frozen 0.1
+    assert V.__version__ == importlib.metadata.version("verifloat")   # one version, in the package
 
 
 @pytest.mark.parametrize("mod", MODULES)

@@ -56,6 +56,10 @@ using i128 = I128;
 #endif
 using BigInt = boost::multiprecision::cpp_int;
 
+// Widest integer and fixed-point formats (bits), as mantissa_bits is capped
+// for FP formats: wider ones would take memory without bound.
+constexpr int64_t kMaxIntBits = int64_t(1) << 24;
+
 // Widest intermediate the u128 tier may hold.
 constexpr int64_t kU128Bits = 126;
 

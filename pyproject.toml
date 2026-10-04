@@ -1,10 +1,10 @@
 [project]
 name = "VeriFloat"
-version = "0.1.0"
+dynamic = ["version"]     # from src/verifloat/__init__.py (see [tool.scikit-build.metadata])
 description = "Bit-accurate floating-point, integer and block-scaled types with a C++ core, as golden models for cocotb RTL testbenches"
 readme = "README.md"
 license = "MIT"
-authors = [{ name = "Shu Yi", email = "yeoshuyi123@gmail.com" }]
+authors = [{ name = "Yeo Shu Yi"}]
 requires-python = ">=3.12"
 dependencies = []
 keywords = ["verification", "rtl", "cocotb", "golden-model", "bit-exact", "floating-point", "minifloat", "fp4", "fp8", "nvfp4", "fpga", "asic"]
@@ -12,8 +12,13 @@ classifiers = [
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Programming Language :: C++",
+    "Programming Language :: Python :: Implementation :: CPython",
     "Development Status :: 3 - Alpha",
-    "Operating System :: OS Independent",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+    "Operating System :: Microsoft :: Windows",
     "Intended Audience :: Developers",
     "Intended Audience :: Science/Research",
     "Topic :: Scientific/Engineering",
@@ -22,8 +27,15 @@ classifiers = [
     "Typing :: Typed",
 ]
 
+[project.urls]
+Homepage = "https://github.com/yeoshuyi/VeriFloat"
+Documentation = "https://github.com/yeoshuyi/VeriFloat/blob/main/docs/README.md"
+Repository = "https://github.com/yeoshuyi/VeriFloat"
+Issues = "https://github.com/yeoshuyi/VeriFloat/issues"
+Changelog = "https://github.com/yeoshuyi/VeriFloat/blob/main/CHANGELOG.md"
+
 [build-system]
-requires = ["scikit-build-core>=0.10", "nanobind>=2.4"]
+requires = ["scikit-build-core>=0.10,<2", "nanobind>=2.4,<3"]   # a new major version is taken on purpose, not by surprise
 build-backend = "scikit_build_core.build"
 
 [tool.scikit-build]
@@ -31,6 +43,33 @@ minimum-version = "build-system.requires"
 build-dir = "build/{wheel_tag}"
 wheel.packages = ["src/verifloat"]
 cmake.build-type = "Release"
+# The source package: what building needs, the tests and the docs, without
+# the development scaffolding.
+sdist.exclude = [".github", "bench", "tools/in_container", "tools/container_entry.sh", "examples/*/sim_build",
+                 "examples/*/results.xml"]
+
+# One version, in the package; the metadata, verifloat.__version__ and the C
+# library's vf_version() all take it from there.
+[tool.scikit-build.metadata.version]
+provider = "scikit_build_core.metadata.regex"
+input = "src/verifloat/__init__.py"
+
+# Wheels (.github/workflows/release.yml). Every wheel is installed on its own
+# platform and must reproduce the golden corpus, written beforehand into
+# ./corpus by tools/golden_corpus, and pass the test suite.
+[tool.cibuildwheel]
+build = "cp312-* cp313-* cp314-*"
+skip = "*-win32 *_i686 *-win_arm64"        # 64-bit targets only
+build-frontend = "build"
+test-requires = ["pytest", "numpy"]
+test-command = [
+    "python {project}/tools/golden_corpus verify {project}/corpus",
+    "pytest {project}/tests -q -p no:cacheprovider -k \"not test_edge\"",
+]
+environment = { VERIFLOAT_ITERS = "300" }
+
+[tool.cibuildwheel.macos]
+environment = { VERIFLOAT_ITERS = "300", MACOSX_DEPLOYMENT_TARGET = "11.0" }
 
 [dependency-groups]
 dev = [

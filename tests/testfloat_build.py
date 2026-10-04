@@ -17,26 +17,80 @@ import tarfile
 import urllib.request
 from pathlib import Path
 
-# Release 3e (2018) of both, plus a later SoftFloat fix for RISC-V f128 NaNs.
-SOFTFLOAT = ("ucb-bar/berkeley-softfloat-3", "b64af41c3276f97f0e181920400ee056b9c88037")
-TESTFLOAT = ("ucb-bar/berkeley-testfloat-3", "06b20075dd3c1a5d0dd007a93643282832221612")
+# Release 3e (2018) of both, plus a later SoftFloat fix for RISC-V f128 NaNs:
+# (repository, commit, SHA-256 of the extracted file tree; see tree_sha256).
+SOFTFLOAT = ("ucb-bar/berkeley-softfloat-3", "b64af41c3276f97f0e181920400ee056b9c88037",
+             "565192c517a79f7a749fbaa8de752554125bdf8da4ee0cea108e4b7f786cf7d4")
+TESTFLOAT = ("ucb-bar/berkeley-testfloat-3", "06b20075dd3c1a5d0dd007a93643282832221612",
+             "73f07482a3da4fe6a7c6a259947cc509d3b5057f9d6cd786b04cafae5560dcd7")
 SPECIALIZATIONS = ("RISCV", "8086-SSE", "ARM-VFPv2")
 
 
-def _cache() -> Path:
-    return Path(os.environ.get("VERIFLOAT_CACHE", Path.home() / ".cache" / "verifloat"))
+def cache_dir() -> Path:
+    """$VERIFLOAT_CACHE (default ~/.cache/verifloat): programs and libraries
+    the tests build are kept here and later run or loaded, so on POSIX it
+    must belong to this user and be writable by no one else. Write access for
+    others is removed from a directory of this user's; one that belongs to
+    someone else is refused."""
+    path = Path(os.environ.get("VERIFLOAT_CACHE", Path.home() / ".cache" / "verifloat"))
+    path.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if os.name == "posix":
+        st = path.stat()
+        if st.st_uid != os.getuid():
+            raise RuntimeError(f"{path} belongs to another user; it holds programs the tests run")
+        if st.st_mode & 0o022:
+            path.chmod(st.st_mode & ~0o022 & 0o7777)
+    return path
 
 
-def _fetch(repo: str, sha: str, dest: Path) -> None:
+
+def shared_library(source: Path, name: str) -> Path:
+    """tests/native/<source> built with gcc as a shared library in the
+    cache, named by its source's hash. Built under a temporary name and
+    renamed when complete, so an interrupted build is never loaded."""
+    digest = hashlib.sha256(source.read_bytes()).hexdigest()[:12]
+    lib = cache_dir() / f"{name}-{digest}.so"
+    if not lib.exists():
+        tmp = lib.with_name(f"{lib.name}.{os.getpid()}.part")
+        try:
+            subprocess.run(["gcc", "-O1", "-shared", "-fPIC", "-o", str(tmp), str(source)], check=True)
+            os.replace(tmp, lib)
+        finally:
+            tmp.unlink(missing_ok=True)
+    return lib
+
+
+def tree_sha256(root: Path) -> str:
+    """SHA-256 over a directory tree: each path with its file's SHA-256 (or
+    its link target), in sorted order. Unlike a hash of the downloaded
+    archive, it does not change if the server compresses differently."""
+    h = hashlib.sha256()
+    for p in sorted(root.rglob("*"), key=lambda q: q.relative_to(root).as_posix()):
+        rel = p.relative_to(root).as_posix().encode()
+        if p.is_symlink():
+            h.update(b"L" + rel + b"\0" + os.readlink(p).encode() + b"\0")
+        elif p.is_file():
+            h.update(b"F" + rel + b"\0" + hashlib.sha256(p.read_bytes()).digest())
+        elif p.is_dir():
+            h.update(b"D" + rel + b"\0")
+    return h.hexdigest()
+
+
+def _fetch(repo: str, sha: str, tree: str, dest: Path) -> None:
     if dest.exists():
         return
     url = f"https://github.com/{repo}/archive/{sha}.tar.gz"
-    data = urllib.request.urlopen(url, timeout=60).read()
+    with urllib.request.urlopen(url, timeout=60) as r:
+        data = r.read()
     tmp = dest.with_name(dest.name + ".partial")
-    tmp.mkdir(parents=True, exist_ok=True)
+    shutil.rmtree(tmp, ignore_errors=True)
+    tmp.mkdir(parents=True)
     with tarfile.open(fileobj=io.BytesIO(data)) as tar:
         tar.extractall(tmp, filter="data")
     (inner,) = tmp.iterdir()
+    if tree_sha256(inner) != tree:
+        shutil.rmtree(tmp)
+        raise RuntimeError(f"{url}: content does not match the pinned SHA-256")
     inner.rename(dest)
     tmp.rmdir()
 
@@ -51,7 +105,7 @@ def _build(spec: str) -> Path:
     """Build SoftFloat and testfloat_gen for ``spec``; the build's root directory."""
     if not (shutil.which("make") and shutil.which("gcc")):
         raise RuntimeError("gcc and make are needed to build TestFloat")
-    root = _cache() / "testfloat" / f"{SOFTFLOAT[1][:12]}-{TESTFLOAT[1][:12]}"
+    root = cache_dir() / "testfloat" / f"{SOFTFLOAT[1][:12]}-{TESTFLOAT[1][:12]}"
     src = root / "src"
     _fetch(*SOFTFLOAT, src / "berkeley-softfloat-3")
     _fetch(*TESTFLOAT, src / "berkeley-testfloat-3")

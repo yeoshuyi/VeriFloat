@@ -334,9 +334,10 @@ static std::pair<nb::object, uint8_t> int_quantize(const IntF& f, const Q& x) {
 
 static nb::object py_quantize(nb::handle flat_seq, nb::handle shape_t, int64_t axis, nb::handle spec_t) {
     Spec s = spec_from(spec_t);
-    nb::object flat = steal_checked(PySequence_Fast(flat_seq.ptr(), "expected a list"));
-    Py_ssize_t N = PySequence_Fast_GET_SIZE(flat.ptr());
-    PyObject** items = PySequence_Fast_ITEMS(flat.ptr());
+    // A tuple of strong references: parsing a value can run Python code.
+    nb::object flat = snapshot(flat_seq.ptr(), "expected a list");
+    Py_ssize_t N = tuple_size(flat);
+    PyObject** items = N ? &PyTuple_GET_ITEM(flat.ptr(), 0) : nullptr;
     Values vals;
     vals.fv.resize((size_t)N);
     vals.has_fv.assign((size_t)N, 0);
@@ -352,8 +353,13 @@ static nb::object py_quantize(nb::handle flat_seq, nb::handle shape_t, int64_t a
     }
 
     // Rows run along `axis`, ordered over the other axes in C order.
+    nb::object sh = snapshot(shape_t.ptr(), "shape must be a sequence of ints");
     std::vector<int64_t> shape;
-    for (nb::handle h : shape_t) shape.push_back(nb::cast<int64_t>(h));
+    for (Py_ssize_t i = 0; i < tuple_size(sh); ++i) shape.push_back(int_in(tuple_item(sh, i), 1, INT64_MAX, "bad shape"));
+    // The values must be exactly the shape's elements, and axis one of its
+    // axes: every position computed below is then inside the values.
+    if (shape.empty() || checked_count(shape) != (size_t)N || axis < 0 || axis >= (int64_t)shape.size())
+        raise(PyExc_ValueError, "block_quantize: values, shape and axis do not match");
     int64_t nd = (int64_t)shape.size(), n = shape[(size_t)axis];
     std::vector<int64_t> st((size_t)nd);
     int64_t acc = 1;
@@ -610,18 +616,30 @@ static nb::object py_values(nb::handle elems, nb::handle scales, nb::handle zero
 
 // _permute(flat, shape, perm): C-order data of `shape` transposed by `perm`.
 static nb::object py_permute(nb::handle flat_seq, nb::handle shape_t, nb::handle perm_t) {
-    nb::object flat = steal_checked(PySequence_Fast(flat_seq.ptr(), "expected a list"));
-    PyObject** items = PySequence_Fast_ITEMS(flat.ptr());
+    nb::object flat = snapshot(flat_seq.ptr(), "expected a list");
+    nb::object sh = snapshot(shape_t.ptr(), "shape must be a sequence of ints");
+    nb::object pm = snapshot(perm_t.ptr(), "perm must be a sequence of ints");
     std::vector<int64_t> shape, perm;
-    for (nb::handle h : shape_t) shape.push_back(nb::cast<int64_t>(h));
-    for (nb::handle h : perm_t) perm.push_back(nb::cast<int64_t>(h));
+    for (Py_ssize_t i = 0; i < tuple_size(sh); ++i) shape.push_back(int_in(tuple_item(sh, i), 1, INT64_MAX, "bad shape"));
+    // The data must be exactly the shape's elements, and perm a permutation
+    // of its axes: every index below stays inside the data.
+    if ((size_t)tuple_size(flat) != checked_count(shape) || tuple_size(pm) != (Py_ssize_t)shape.size())
+        raise(PyExc_ValueError, "permute: data, shape and perm do not match");
+    std::vector<bool> seen(shape.size());
+    for (Py_ssize_t i = 0; i < tuple_size(pm); ++i) {
+        const int64_t p = int_in(tuple_item(pm, i), 0, (int64_t)shape.size() - 1, "permute: bad axis");
+        if (seen[(size_t)p]) raise(PyExc_ValueError, "permute: perm repeats an axis");
+        seen[(size_t)p] = true;
+        perm.push_back(p);
+    }
+    PyObject** items = tuple_size(flat) ? &PyTuple_GET_ITEM(flat.ptr(), 0) : nullptr;
     size_t nd = shape.size();
     std::vector<int64_t> st(nd);
     int64_t acc = 1;
     for (int64_t i = (int64_t)nd - 1; i >= 0; --i) { st[(size_t)i] = acc; acc *= shape[(size_t)i]; }
     std::vector<int64_t> nshape(nd), nst(nd);
     for (size_t i = 0; i < nd; ++i) { nshape[i] = shape[(size_t)perm[i]]; nst[i] = st[(size_t)perm[i]]; }
-    Py_ssize_t total = PySequence_Fast_GET_SIZE(flat.ptr());
+    Py_ssize_t total = tuple_size(flat);
     nb::object out = steal_checked(PyList_New(total));
     std::vector<int64_t> idx(nd, 0);
     int64_t off = 0;
@@ -638,13 +656,16 @@ static nb::object py_permute(nb::handle flat_seq, nb::handle shape_t, nb::handle
 }
 
 // blockscale._shape + _flatten in one pass; None if a BlockTensor is nested.
-static bool shape_walk(PyObject* v, PyObject* bt, std::vector<int64_t>& shape, PyObject* flat) {
+// No Python code runs here. The depth is limited, which also stops a list
+// that contains itself.
+static bool shape_walk(PyObject* v, PyObject* bt, std::vector<int64_t>& shape, PyObject* flat, size_t depth = 0) {
     if (PyObject_TypeCheck(v, (PyTypeObject*)bt)) return false;
     shape.clear();
     if (!PyList_Check(v) && !PyTuple_Check(v)) {
         if (PyList_Append(flat, v) < 0) raise_current();
         return true;
     }
+    if (depth >= kMaxDims) raise(PyExc_ValueError, "too many dimensions (at most 64), or a list that contains itself");
     Py_ssize_t n = PySequence_Fast_GET_SIZE(v);
     if (n == 0) raise(PyExc_ValueError, "empty tensor");
     PyObject** items = PySequence_Fast_ITEMS(v);
@@ -659,7 +680,7 @@ static bool shape_walk(PyObject* v, PyObject* bt, std::vector<int64_t>& shape, P
             else if (!first_leaf) ragged = true;
             continue;
         }
-        if (!shape_walk(x, bt, i ? cur : first, flat)) return false;
+        if (!shape_walk(x, bt, i ? cur : first, flat, depth + 1)) return false;
         if (i && (first_leaf || cur != first)) ragged = true;
     }
     if (ragged) raise(PyExc_ValueError, "ragged nested lists: all rows must have the same shape");
@@ -679,9 +700,9 @@ static nb::object py_shape_flatten(nb::handle values, nb::handle bt) {
 
 // Every element an FP, an int, a finite float or a Fraction?
 static bool py_plain_numbers(nb::handle seq) {
-    nb::object f = steal_checked(PySequence_Fast(seq.ptr(), "expected a sequence"));
-    Py_ssize_t n = PySequence_Fast_GET_SIZE(f.ptr());
-    PyObject** items = PySequence_Fast_ITEMS(f.ptr());
+    nb::object f = snapshot(seq.ptr(), "expected a sequence");
+    Py_ssize_t n = tuple_size(f);
+    PyObject** items = n ? &PyTuple_GET_ITEM(f.ptr(), 0) : nullptr;
     for (Py_ssize_t i = 0; i < n; ++i) {
         PyObject* x = items[i];
         if (is_fp(x) || PyLong_Check(x) || is_fraction(x)) continue;

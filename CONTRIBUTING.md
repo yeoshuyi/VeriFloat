@@ -34,3 +34,33 @@ pip install -C cmake.define.VF_PORTABLE_INT128=ON .  # the portable 128-bit inte
 ```
 
 CI (`.github/workflows/tests.yml`) runs the suite and the corpus on Linux x86-64 and ARM, macOS (Apple silicon and Intel), Windows with MSVC and with MinGW-w64, and Linux with the portable 128-bit integers.
+
+## Releasing
+
+`.github/workflows/release.yml` builds the source package and the wheels
+(cibuildwheel: Linux x86-64 and aarch64 with glibc and musl, macOS on Apple
+silicon and Intel, Windows x86-64; CPython 3.12 to 3.14). Every wheel is
+installed on its own platform, must reproduce the golden corpus and passes the
+test suite before anything is uploaded. Uploads use PyPI trusted publishing:
+no token is stored anywhere.
+
+Once, on each index (<https://test.pypi.org> and <https://pypi.org>, accounts
+with two-factor login): *Your account → Publishing → Add a new pending
+publisher*, with project `verifloat`, owner `yeoshuyi`, repository
+`VeriFloat`, workflow `release.yml`, and environment `testpypi` or `pypi`.
+On GitHub, create the two environments (*Settings → Environments*); giving
+`pypi` a required reviewer means every upload waits for a click.
+
+For each release:
+
+1. Set the version in `src/verifloat/__init__.py` (the only place it is
+   written) and move the `CHANGELOG.md` entry from "unreleased" to the date.
+2. Push, and wait for `tests` to pass on every platform.
+3. *Actions → release → Run workflow* with target `testpypi`. Then, in a
+   clean environment on each OS:
+   `pip install -i https://test.pypi.org/simple/ verifloat==X.Y.Z` and try it.
+4. `git tag vX.Y.Z && git push origin vX.Y.Z`: the same build runs again and
+   uploads to PyPI. The tag must match the package version.
+
+A version can never be uploaded twice: a broken release is yanked on PyPI and
+followed by a new version.
