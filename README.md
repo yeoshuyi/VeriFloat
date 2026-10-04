@@ -20,6 +20,7 @@ for verifying RTL from [cocotb](https://www.cocotb.org/) testbenches in Python, 
 [Examples](https://github.com/yeoshuyi/VeriFloat/tree/main/examples) ·
 [Contributing](https://github.com/yeoshuyi/VeriFloat/blob/main/CONTRIBUTING.md)
 
+> This project is written with AI assistance, through Claude Code (Opus 5.5)
 </div>
 
 ---
